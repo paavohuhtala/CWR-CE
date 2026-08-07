@@ -28,6 +28,7 @@
 #include <Poseidon/Dev/Debug/DebugOverlay.hpp>
 #include <Poseidon/Dev/Debug/DebugCheats.hpp>
 #include <Poseidon/Dev/Debug/DebugCommands.hpp>
+#include <Poseidon/Dev/Debug/WtrTestHarness.hpp>
 #include <Poseidon/Foundation/Logging/Logging.hpp>
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Core/Config/EngineConfig.hpp>
@@ -43,15 +44,27 @@
 #include <Poseidon/Dev/Diag/FrameProfiler.hpp>
 #include <Poseidon/UI/Settings/GameSettingsConfig.hpp>
 #include <Poseidon/UI/Settings/AspectRatio.hpp>
+#include <Poseidon/UI/Controls/UIControls.hpp>
 #include <Poseidon/Graphics/Core/Engine.hpp>
+#include <Poseidon/Graphics/Rendering/WaterInteractionBridge.hpp>
 #include <Poseidon/Core/Global.hpp>
+#include <Poseidon/IO/ParamFileExt.hpp>
 #include <Poseidon/Foundation/Memory/CheckMem.hpp>
 #include <Poseidon/Foundation/Memory/MemFreeReq.hpp>
 #include <Poseidon/World/World.hpp>
 #include <Poseidon/World/WorldInputContext.hpp>
+#include <Poseidon/World/Scene/Camera/CamEffects.hpp>
+#include <Poseidon/World/Scene/Camera/CameraHold.hpp>
+#include <Poseidon/World/Scene/Camera/Camera.hpp>
 #include <Poseidon/World/Entities/Infantry/Person.hpp>
 #include <Poseidon/World/Entities/Vehicles/Transport.hpp>
 #include <Poseidon/World/Scene/Object.hpp>
+#include <Poseidon/World/Terrain/Landscape.hpp>
+#include <Poseidon/AI/AICenter.hpp>
+#include <Poseidon/AI/AIGroup.hpp>
+#include <Poseidon/AI/AIUnit.hpp>
+#include <Poseidon/AI/EntityAI.hpp>
+#include <Poseidon/Network/Network.hpp>
 #include <Poseidon/Foundation/Common/GamePaths.hpp>
 #include <Evaluator/express.hpp>
 #include <filesystem>
@@ -67,7 +80,14 @@ extern void SetVisibility(float distance);
 #include <cstring>
 #include <cstdio>
 #include <functional>
+#include <array>
 #include <vector>
+
+// The cutscene letterbox state, defined at global scope in WorldSetup.cpp. Declared here rather
+// than pulled in via a header because only the Zeus camera needs it, and it must be at global
+// scope: declared inside the namespaces below, these would be new symbols that never link.
+extern bool showCinemaBorder;
+void ShowCinemaBorder(bool show);
 
 namespace Poseidon::Dev
 {
@@ -119,6 +139,997 @@ std::vector<std::function<void()>> s_pendingActions;
 void Defer(std::function<void()> action)
 {
     s_pendingActions.push_back(std::move(action));
+}
+
+void ApplyDevPanelMouseState();
+
+// Zeus is deliberately a dev-panel feature, rather than a mission-script
+// command.  The camera is the engine's native manual CameraVehicle, which
+// already implements collision-safe free flight and the normal movement
+// bindings.  Keeping it here also means it cannot leak into release builds.
+OLink<CameraVehicle> s_zeusCamera;
+// showCinemaBorder is a GLOBAL that defaults to true, so ANY active camera effect draws the
+// cutscene letterbox -- the CinemaBorder model plus the widescreen pillarbox bars. Zeus free-fly
+// installs a camera effect, so it inherited the letterbox and the view shrank to a cinematic band
+// the moment you enabled it. That is right for a cutscene and wrong for a developer camera.
+//
+// Saved and restored rather than forced off, because `showCinemaBorder` is also an SQF command a
+// mission may have set deliberately; Zeus is a temporary takeover and must give it back.
+//
+// Read through the global rather than a getter: ShowCinemaBorder(bool) has no matching reader,
+// and adding one for a dev panel is more surface than this needs. Both are declared at GLOBAL
+// scope above -- declaring them in here would name new symbols inside this namespace instead.
+bool s_zeusPrevCinemaBorder = true;
+std::string s_zeusStatus;
+int s_zeusSide = 0;
+int s_zeusSpawnKind = 0;
+int s_zeusPreset = 0;
+int s_zeusCount = 1;
+float s_zeusDistance = 25.0f;
+float s_zeusHeading = 0.0f;
+char s_zeusClassName[96] = "SoldierWB";
+bool s_zeusClickPlacement = false;
+bool s_zeusConsumeMouseEvent = false;
+bool s_zeusSuppressNextMouseUp = false;
+bool s_zeusRotateDrag = false;
+bool s_zeusMoveDrag = false;
+bool s_zeusLassoDrag = false;
+bool s_zeusConsumeKeyboardEvent = false;
+bool s_zeusConsumeShortcutKeyUp = false;
+float s_zeusLassoStartX = 0.0f;
+float s_zeusLassoStartY = 0.0f;
+float s_zeusLassoEndX = 0.0f;
+float s_zeusLassoEndY = 0.0f;
+Ref<ControlsContainer> s_zeusCursor;
+
+struct ZeusSpawnRecord
+{
+    OLink<Entity> object;
+    std::string className;
+    int kind;
+    TargetSide side;
+};
+std::vector<ZeusSpawnRecord> s_zeusSpawned;
+std::vector<ZeusSpawnRecord> s_zeusSelection;
+std::vector<ZeusSpawnRecord> s_zeusClipboard;
+std::vector<Vector3> s_zeusMoveOffsets;
+
+constexpr std::array<const char*, 4> kZeusSideNames = {"West", "East", "Resistance", "Civilian"};
+constexpr std::array<TargetSide, 4> kZeusSides = {TWest, TEast, TGuerrila, TCivilian};
+constexpr std::array<const char*, 6> kZeusUnitPresets = {"SoldierWB", "SoldierEB", "SoldierGB",
+                                                         "OfficerW",  "OfficerE",  "Civilian"};
+constexpr std::array<const char*, 7> kZeusVehiclePresets = {"Jeep", "UAZ", "M1A1", "T72", "BMP", "UH60", "Mi17"};
+
+bool ZeusWorldAvailable()
+{
+    return GWorld && GLandscape && GWorld->CameraOn();
+}
+
+void SetZeusClassFromPreset()
+{
+    if (s_zeusSpawnKind == 0)
+    {
+        const int preset = std::clamp(s_zeusPreset, 0, static_cast<int>(kZeusUnitPresets.size()) - 1);
+        snprintf(s_zeusClassName, sizeof(s_zeusClassName), "%s", kZeusUnitPresets[preset]);
+    }
+    else
+    {
+        const int preset = std::clamp(s_zeusPreset, 0, static_cast<int>(kZeusVehiclePresets.size()) - 1);
+        snprintf(s_zeusClassName, sizeof(s_zeusClassName), "%s", kZeusVehiclePresets[preset]);
+    }
+}
+
+void EnableZeusCamera()
+{
+    if (!ZeusWorldAvailable())
+    {
+        s_zeusStatus = "Zeus requires a loaded world.";
+        return;
+    }
+    if (s_zeusCamera)
+    {
+        s_zeusStatus = "Free-fly camera is already active.";
+        return;
+    }
+
+    Object* source = GWorld->CameraOn();
+    auto* camera = new CameraVehicle();
+    camera->SetPosition(source->CameraPosition());
+    camera->SetDirectionAndUp(source->Direction(), VUp);
+    camera->SetManual(true);
+    camera->SetAltitudeSpeedScaling(true);
+    camera->SetMouseLookRequiresRightButton(true);
+    camera->SetCrossHairs(false);
+    camera->ResetTargets();
+    GWorld->AddAnimal(camera);
+    GWorld->SetCameraEffect(CreateCameraEffect(camera, "Internal", CamEffectTop, true));
+    s_zeusCamera = camera;
+    s_zeusPrevCinemaBorder = showCinemaBorder;
+    ShowCinemaBorder(false);
+    s_zeusCursor = new ControlsContainer(nullptr);
+    s_zeusStatus = "Free-fly active: WASD move, Q/Z up/down, Shift doubles speed; hold RMB to look. Click Zeus objects "
+                   "to select. Press Ctrl+` to reopen Zeus.";
+    // The panel captures mouse input while it is visible. Hide it immediately
+    // so the camera becomes controllable as soon as Zeus is enabled.
+    SetVisible(false);
+}
+
+void DisableZeusCamera()
+{
+    if (!s_zeusCamera)
+    {
+        s_zeusStatus = "Free-fly camera is not active.";
+        return;
+    }
+    GWorld->SetCameraEffect(nullptr);
+    ShowCinemaBorder(s_zeusPrevCinemaBorder);
+    s_zeusCamera->SetDelete();
+    s_zeusCamera = nullptr;
+    s_zeusClickPlacement = false;
+    s_zeusRotateDrag = false;
+    s_zeusMoveDrag = false;
+    s_zeusLassoDrag = false;
+    s_zeusCursor = nullptr;
+    ApplyDevPanelMouseState();
+    s_zeusStatus = "Free-fly ended; returned to the normal camera.";
+}
+
+// --- Zeus cursor coordinates ------------------------------------------------
+//
+// The focused Zeus viewport draws the engine's own cursor sprite
+// (ControlsContainer::DrawCursor).  That sprite is placed from the engine's
+// normalised cursor (InputSubsystem::GetCursorX/Y, -1..+1 across the 2D
+// surface), which is accumulated from *relative* mouse motion and scaled by
+// the engine's own cursor sensitivity and aspect correction.  SDL button and
+// motion events carry absolute window pixels instead: a different origin, a
+// different scale, and — under relative mouse mode — no meaningful value at
+// all.  The two spaces drift apart, so a click lands somewhere other than
+// where the visible cursor points.
+//
+// Every Zeus interaction (pick, lasso, group move, paste, cursor spawning)
+// therefore resolves its position through ZeusCursorPixel() below, and never
+// from raw SDL event coordinates.  ZeusCursorPixel returns *framebuffer
+// pixels*, which is the space camera->Projection() maps world positions into,
+// so picking and the ImGui overlay share one frame of reference.
+struct ZeusPoint
+{
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
+ZeusPoint ZeusCursorPixel()
+{
+    ZeusPoint point;
+    if (!GEngine)
+        return point;
+    const auto& input = InputSubsystem::Instance();
+    point.x = (input.GetCursorX() * 0.5f + 0.5f) * static_cast<float>(GEngine->Width());
+    point.y = (input.GetCursorY() * 0.5f + 0.5f) * static_cast<float>(GEngine->Height());
+    return point;
+}
+
+// Framebuffer pixels -> ImGui overlay coordinates.  ImGui works in window
+// logical units, which differ from framebuffer pixels whenever the display
+// scale is not 1.
+ImVec2 ZeusPixelToImGui(float pixelX, float pixelY)
+{
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float scaleX = (GEngine && GEngine->Width() > 0) ? display.x / static_cast<float>(GEngine->Width()) : 1.0f;
+    const float scaleY = (GEngine && GEngine->Height() > 0) ? display.y / static_cast<float>(GEngine->Height()) : 1.0f;
+    return ImVec2(pixelX * scaleX, pixelY * scaleY);
+}
+
+// World position -> framebuffer pixels, or false when the position is behind
+// the near plane.  Shared by picking, lasso hit-testing and marker drawing so
+// they can never disagree about where an object appears.
+bool ZeusProjectToPixel(Vector3Par position, ZeusPoint& pixel)
+{
+    const Camera* camera = GScene ? GScene->GetCamera() : nullptr;
+    if (!camera)
+        return false;
+    Vector3 projected = GScene->ScaledInvTransform() * position;
+    if (projected.Z() < camera->Near())
+        return false;
+    const Matrix4& projection = camera->Projection();
+    const float invZ = 1.0f / projected.Z();
+    pixel.x = projection(0, 2) + projection(0, 0) * projected[0] * invZ;
+    pixel.y = projection(1, 2) + projection(1, 1) * projected[1] * invZ;
+    return true;
+}
+
+Vector3 ZeusSpawnPosition(int index, int count)
+{
+    Object* source = s_zeusCamera ? static_cast<Object*>(s_zeusCamera) : GWorld->CameraOn();
+    Vector3 pos = source->Position() + source->Direction() * s_zeusDistance;
+    const float offset = (static_cast<float>(index) - (static_cast<float>(count) - 1.0f) * 0.5f) * 4.0f;
+    pos += source->DirectionAside() * offset;
+    pos[1] = GLandscape->RoadSurfaceYAboveWater(pos[0], pos[2]);
+    return pos;
+}
+
+Vector3 ZeusSpawnPositionFromAnchor(Vector3Par anchor, int index, int count)
+{
+    // A single placement must land exactly under the cursor.  More than one
+    // infantry/vehicle cannot safely occupy exactly the same collision volume,
+    // so only a multi-spawn uses a compact lateral formation around that
+    // literal cursor anchor.
+    if (count <= 1)
+        return anchor;
+    Object* source = s_zeusCamera ? static_cast<Object*>(s_zeusCamera) : GWorld->CameraOn();
+    const float offset = (static_cast<float>(index) - (static_cast<float>(count) - 1.0f) * 0.5f) * 4.0f;
+    Vector3 pos = anchor + source->DirectionAside() * offset;
+    pos[1] = GLandscape->RoadSurfaceYAboveWater(pos[0], pos[2]);
+    return pos;
+}
+
+bool ZeusClickPositionAtPixel(Vector3& position, float pixelX, float pixelY)
+{
+    if (!s_zeusCamera || !GLandscape)
+        return false;
+    const Camera* camera = GScene ? GScene->GetCamera() : nullptr;
+    if (!camera)
+        return false;
+    // Invert exactly the projection ZeusProjectToPixel applies.  Doing the
+    // unprojection this way (rather than assuming the world fills the
+    // framebuffer) keeps the ray correct when AspectSettings renders the world
+    // into a sub-rectangle, and makes the ray agree with the pick test.
+    const Matrix4& projection = camera->Projection();
+    if (projection(0, 0) == 0.0f || projection(1, 1) == 0.0f)
+        return false;
+    const float ndcX = (pixelX - projection(0, 2)) / projection(0, 0);
+    // projection(1, 1) is negative (screen Y grows downwards), so ndcY comes
+    // out positive-up and adds to DirectionUp directly.
+    const float ndcY = (pixelY - projection(1, 2)) / projection(1, 1);
+    const Vector3 direction = (s_zeusCamera->Direction() + s_zeusCamera->DirectionAside() * ndcX * camera->Left() +
+                               s_zeusCamera->DirectionUp() * ndcY * camera->Top())
+                                  .Normalized();
+    return GLandscape->IntersectWithGroundOrSea(&position, s_zeusCamera->Position(), direction, 0.0f, 10000.0f) >= 0.0f;
+}
+
+bool ZeusClickPosition(Vector3& position)
+{
+    const ZeusPoint cursor = ZeusCursorPixel();
+    return ZeusClickPositionAtPixel(position, cursor.x, cursor.y);
+}
+
+void RememberZeusSpawn(Entity* object, const char* className, int kind, TargetSide side)
+{
+    if (object)
+        s_zeusSpawned.push_back({object, className, kind, side});
+}
+
+void PruneZeusRecords(std::vector<ZeusSpawnRecord>& records)
+{
+    records.erase(
+        std::remove_if(records.begin(), records.end(), [](const ZeusSpawnRecord& record) { return !record.object; }),
+        records.end());
+}
+
+// cursorX/cursorY are framebuffer pixels from ZeusCursorPixel().
+void SelectZeusAtCursor(float cursorX, float cursorY)
+{
+    PruneZeusRecords(s_zeusSpawned);
+    const Camera* camera = GScene ? GScene->GetCamera() : nullptr;
+    if (!camera)
+        return;
+    ZeusSpawnRecord* closest = nullptr;
+    float closestDistance2 = Square(30.0f);
+    for (auto& record : s_zeusSpawned)
+    {
+        ZeusPoint pixel;
+        if (!ZeusProjectToPixel(record.object->Position(), pixel))
+            continue;
+        const float distance2 = Square(pixel.x - cursorX) + Square(pixel.y - cursorY);
+        if (distance2 < closestDistance2)
+        {
+            closest = &record;
+            closestDistance2 = distance2;
+        }
+    }
+    if (closest)
+    {
+        // Clicking a member of an existing lasso selection starts a group
+        // move.  Do not collapse the selection to the clicked unit: the
+        // move-drag code deliberately keeps every member's offset from the
+        // anchor and places the group atomically on mouse release.
+        const bool alreadySelected =
+            std::any_of(s_zeusSelection.begin(), s_zeusSelection.end(), [closest](const ZeusSpawnRecord& record)
+                        { return record.object.GetLink() == closest->object.GetLink(); });
+        if (!alreadySelected)
+        {
+            s_zeusSelection.clear();
+            s_zeusSelection.push_back(*closest);
+        }
+        s_zeusStatus = alreadySelected
+                           ? "Moving " + std::to_string(s_zeusSelection.size()) + " selected Zeus object(s)."
+                           : "Selected " + closest->className + ".";
+    }
+    else
+    {
+        s_zeusSelection.clear();
+        s_zeusStatus = "No Zeus-spawned object under the cursor.";
+    }
+}
+
+// The rectangle corners are framebuffer pixels from ZeusCursorPixel().
+void SelectZeusInRect(float startX, float startY, float endX, float endY)
+{
+    PruneZeusRecords(s_zeusSpawned);
+    const Camera* camera = GScene ? GScene->GetCamera() : nullptr;
+    if (!camera)
+        return;
+    const float left = std::min(startX, endX);
+    const float right = std::max(startX, endX);
+    const float top = std::min(startY, endY);
+    const float bottom = std::max(startY, endY);
+    s_zeusSelection.clear();
+    for (const auto& record : s_zeusSpawned)
+    {
+        ZeusPoint pixel;
+        if (!ZeusProjectToPixel(record.object->Position(), pixel))
+            continue;
+        if (pixel.x >= left && pixel.x <= right && pixel.y >= top && pixel.y <= bottom)
+            s_zeusSelection.push_back(record);
+    }
+    s_zeusStatus = "Selected " + std::to_string(s_zeusSelection.size()) + " Zeus object(s).";
+}
+
+void StabilizeZeusInfantry(Person* person, Vector3Val direction)
+{
+    if (!person)
+        return;
+    if (AIUnit* unit = person->Brain())
+    {
+        // Replan after a Zeus move so the Arcade mission does not retain a
+        // stale move-function queue. Target acquisition remains enabled:
+        // opposing Zeus-spawned sides are expected to detect and engage.
+        unit->ForceReplan(true);
+        unit->SetAIDisabled(AIUnit::DAMove);
+        unit->SetWatchDirection(direction);
+    }
+}
+
+void RotateZeusSelectionBy(float degrees)
+{
+    PruneZeusRecords(s_zeusSelection);
+    for (const auto& record : s_zeusSelection)
+    {
+        Matrix4 transform = record.object->Transform();
+        transform.SetOrientation(Matrix3(MRotationY, degrees * (H_PI / 180.0f)) * transform.Orientation());
+        record.object->MoveNetAware(transform);
+        StabilizeZeusInfantry(dyn_cast<Person>(record.object.GetLink()), transform.Direction());
+    }
+}
+
+void BeginZeusMoveDrag()
+{
+    PruneZeusRecords(s_zeusSelection);
+    s_zeusMoveOffsets.clear();
+    if (s_zeusSelection.empty())
+        return;
+    const Vector3 anchor = s_zeusSelection.front().object->Position();
+    for (const auto& record : s_zeusSelection)
+        s_zeusMoveOffsets.push_back(record.object->Position() - anchor);
+    s_zeusMoveDrag = true;
+    s_zeusStatus = "Drag to move the selected Zeus object(s).";
+}
+
+// pixelX/pixelY are framebuffer pixels from ZeusCursorPixel().
+void MoveZeusSelectionAtPixel(float pixelX, float pixelY)
+{
+    Vector3 target;
+    if (!ZeusClickPositionAtPixel(target, pixelX, pixelY))
+        return;
+    PruneZeusRecords(s_zeusSelection);
+    for (int i = 0; i < static_cast<int>(s_zeusSelection.size()) && i < static_cast<int>(s_zeusMoveOffsets.size()); ++i)
+    {
+        const auto& record = s_zeusSelection[i];
+        Matrix4 transform = record.object->Transform();
+        Vector3 position = target + s_zeusMoveOffsets[i];
+        position[1] = GLandscape->RoadSurfaceYAboveWater(position[0], position[2]);
+        transform.SetPosition(position);
+        if (Person* person = dyn_cast<Person>(record.object.GetLink()))
+        {
+            StabilizeZeusInfantry(person, transform.Direction());
+            Vector3 normal;
+            EntityAI* entity = dyn_cast<EntityAI>(record.object.GetLink());
+            if (entity && AIUnit::FindFreePosition(position, normal, true, entity))
+                transform.SetPosition(position);
+            person->PlaceOnSurface(transform);
+            person->SetTransform(transform);
+        }
+        else
+            record.object->MoveNetAware(transform);
+    }
+}
+
+void MoveZeusSelectionVertical(float deltaY)
+{
+    PruneZeusRecords(s_zeusSelection);
+    if (s_zeusSelection.empty() || !GLandscape)
+        return;
+
+    int moved = 0;
+    for (const auto& record : s_zeusSelection)
+    {
+        Matrix4 transform = record.object->Transform();
+        Vector3 position = transform.Position();
+        const float groundY = GLandscape->RoadSurfaceYAboveWater(position[0], position[2]);
+        position[1] = std::max(groundY, position[1] + deltaY);
+        transform.SetPosition(position);
+
+        if (Person* person = dyn_cast<Person>(record.object.GetLink()))
+        {
+            // Do not call PlaceOnSurface here: Game Master elevation is an
+            // explicit vertical transform, while terrain placement should
+            // remain reserved for spawn and horizontal drag/drop.
+            person->SetTransform(transform);
+            StabilizeZeusInfantry(person, transform.Direction());
+        }
+        else
+        {
+            record.object->MoveNetAware(transform);
+        }
+        ++moved;
+    }
+    s_zeusStatus = "Raised/lowered " + std::to_string(moved) + " Zeus object(s).";
+}
+
+void RotateZeusSelection()
+{
+    PruneZeusRecords(s_zeusSelection);
+    for (const auto& record : s_zeusSelection)
+    {
+        Matrix4 transform = record.object->Transform();
+        transform.SetOrientation(Matrix3(MRotationY, s_zeusHeading * (H_PI / 180.0f)));
+        record.object->MoveNetAware(transform);
+    }
+    s_zeusStatus = "Rotated " + std::to_string(s_zeusSelection.size()) + " selected Zeus object(s).";
+}
+
+void DeleteZeusSelection()
+{
+    PruneZeusRecords(s_zeusSelection);
+    for (const auto& record : s_zeusSelection)
+    {
+        // AIUnit owns links from its group and sensor to the Person.  Removing
+        // only the vehicle leaves a live AIUnit with no Person, which crashes
+        // on the next AI think.
+        if (Person* person = dyn_cast<Person>(record.object.GetLink()))
+        {
+            if (AIUnit* unit = person->Brain())
+                unit->DestroyObject();
+        }
+        record.object->SetDelete();
+    }
+    const int count = static_cast<int>(s_zeusSelection.size());
+    s_zeusSelection.clear();
+    s_zeusStatus = "Deleted " + std::to_string(count) + " selected Zeus object(s).";
+}
+
+bool SpawnZeusVehicle(const char* className, Vector3Par position, float heading)
+{
+    Ref<Entity> vehicle = NewNonAIVehicle(className);
+    if (!vehicle)
+        return false;
+
+    EntityAI* aiVehicle = dyn_cast<EntityAI>(vehicle.GetRef());
+    Matrix4 transform;
+    transform.SetPosition(position);
+    transform.SetOrientation(Matrix3(MRotationY, heading * (H_PI / 180.0f)));
+    if (aiVehicle)
+        aiVehicle->PlaceOnSurface(transform);
+    vehicle->SetTransform(transform);
+    vehicle->Init(transform);
+
+    if (aiVehicle)
+    {
+        if (aiVehicle->GetNonAIType()->IsKindOf(GWorld->Preloaded(VTypeStatic)))
+        {
+            GWorld->AddBuilding(vehicle);
+            if (GWorld->GetMode() == GModeNetware)
+                GetNetworkManager().CreateVehicle(vehicle, VLTBuilding, "", -1);
+        }
+        else
+        {
+            GWorld->AddVehicle(vehicle);
+            if (GWorld->GetMode() == GModeNetware)
+                GetNetworkManager().CreateVehicle(vehicle, VLTVehicle, "", -1);
+        }
+    }
+    else
+    {
+        GWorld->AddAnimal(vehicle);
+        if (GWorld->GetMode() == GModeNetware)
+            GetNetworkManager().CreateVehicle(vehicle, VLTAnimal, "", -1);
+    }
+
+    RememberZeusSpawn(vehicle, className, 1, TLogic);
+
+    return true;
+}
+
+bool SpawnZeusUnit(const char* className, TargetSide side, Vector3Par position, float heading)
+{
+    AICenter* center = GWorld->GetCenter(side);
+    if (!center)
+        center = GWorld->CreateCenter(side);
+    if (!center || center->NGroups() >= MaxGroups)
+        return false;
+
+    // A Zeus unit must never be a hostile target to an AI centre of its own
+    // side.  This is normally established by mission loading, but also makes
+    // runtime-spawned units safe when a centre was created after the mission.
+    // Do not alter cross-side relationships: authored mission alliances stay
+    // authoritative.
+    center->SetFriendship(side, 1.0f);
+
+    Ref<EntityAI> vehicle = NewVehicle(className);
+    Person* soldier = dyn_cast<Person>(vehicle.GetRef());
+    if (!soldier)
+        return false;
+
+    Ref<AIGroup> group = new AIGroup();
+    center->AddGroup(group);
+    group->AddFirstWaypoint(position);
+    Mission mission;
+    mission._action = Mission::Arcade;
+    center->SendMission(group, mission);
+    if (GWorld->GetMode() == GModeNetware)
+        GetNetworkManager().CreateObject(group);
+
+    // Follow the regular createUnit path: find a collision-free spot before
+    // initializing the soldier, which prevents invalid move/action state.
+    Vector3 normal;
+    Vector3 safePosition = position;
+    if (AIUnit::FindFreePosition(safePosition, normal, true, vehicle))
+    {
+        float dx, dz;
+        safePosition[1] = GLandscape->RoadSurfaceYAboveWater(safePosition[0], safePosition[2], &dx, &dz);
+    }
+
+    Matrix4 transform;
+    transform.SetPosition(safePosition);
+    transform.SetOrientation(Matrix3(MRotationY, heading * (H_PI / 180.0f)));
+    vehicle->PlaceOnSurface(transform);
+    vehicle->SetTransform(transform);
+    vehicle->Init(transform);
+    vehicle->SetTargetSide(side);
+    GWorld->AddVehicle(vehicle);
+    if (GWorld->GetMode() == GModeNetware)
+        GetNetworkManager().CreateVehicle(vehicle, VLTVehicle, "", -1);
+    GWorld->AddSensor(soldier);
+
+    AIUnit* unit = soldier->Brain();
+    if (!unit)
+        return false;
+    unit->Load(center->NextSoldierIdentity(soldier->IsWoman()));
+    AIUnitInfo& aiInfo = soldier->GetInfo();
+    aiInfo._rank = RankPrivate;
+    aiInfo._initExperience = aiInfo._experience = AI::ExpForRank(RankPrivate);
+    unit->SetAbility(0.5f);
+    group->AddUnit(unit);
+    if (GWorld->GetMode() == GModeNetware)
+    {
+        // Adding the unit may create the subgroup. Register the actual
+        // resulting object, rather than the pre-add null pointer, so Zeus
+        // units have the same network ownership chain as regular units.
+        if (AISubgroup* subgroup = group->MainSubgroup())
+            GetNetworkManager().CreateObject(subgroup);
+        GetNetworkManager().CreateObject(unit);
+    }
+    if (!group->Leader())
+        center->SelectLeader(group);
+    StabilizeZeusInfantry(soldier, transform.Direction());
+    RememberZeusSpawn(vehicle, className, 0, side);
+    return true;
+}
+
+void SpawnZeusSelection()
+{
+    if (!ZeusWorldAvailable())
+    {
+        s_zeusStatus = "Spawning requires a loaded world.";
+        return;
+    }
+    if (s_zeusClassName[0] == '\0')
+    {
+        s_zeusStatus = "Enter a config class name first.";
+        return;
+    }
+
+    const int count = std::clamp(s_zeusCount, 1, 32);
+    Vector3 anchor;
+    const bool cursorAnchor = ZeusClickPosition(anchor);
+    int spawned = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        // Preserve the former camera-forward placement only if the cursor ray
+        // has no terrain/sea intersection (for example, when pointed beyond
+        // the map); normal Zeus spawning is cursor-anchored.
+        const Vector3 position =
+            cursorAnchor ? ZeusSpawnPositionFromAnchor(anchor, i, count) : ZeusSpawnPosition(i, count);
+        const bool didSpawn = s_zeusSpawnKind == 0
+                                  ? SpawnZeusUnit(s_zeusClassName, kZeusSides[s_zeusSide], position, s_zeusHeading)
+                                  : SpawnZeusVehicle(s_zeusClassName, position, s_zeusHeading);
+        spawned += didSpawn ? 1 : 0;
+    }
+    s_zeusStatus = "Spawned " + std::to_string(spawned) + " / " + std::to_string(count) + " " + s_zeusClassName + ".";
+}
+
+void SpawnZeusAtClick()
+{
+    Vector3 position;
+    if (!ZeusClickPosition(position))
+    {
+        s_zeusStatus = "No terrain was under the Zeus crosshair.";
+        return;
+    }
+    const bool spawned = s_zeusSpawnKind == 0
+                             ? SpawnZeusUnit(s_zeusClassName, kZeusSides[s_zeusSide], position, s_zeusHeading)
+                             : SpawnZeusVehicle(s_zeusClassName, position, s_zeusHeading);
+    s_zeusStatus = spawned ? "Placed " + std::string(s_zeusClassName) + "."
+                           : "Could not place " + std::string(s_zeusClassName) + ".";
+}
+
+void PasteZeusAtCursor()
+{
+    Vector3 position;
+    if (!ZeusClickPosition(position))
+    {
+        s_zeusStatus = "No terrain was under the Zeus cursor.";
+        return;
+    }
+    int pasted = 0;
+    for (int i = 0; i < static_cast<int>(s_zeusClipboard.size()); ++i)
+    {
+        const auto& record = s_zeusClipboard[i];
+        Vector3 pastePosition = position + s_zeusCamera->DirectionAside() * (static_cast<float>(i) * 4.0f);
+        pastePosition[1] = GLandscape->RoadSurfaceYAboveWater(pastePosition[0], pastePosition[2]);
+        const bool placed = record.kind == 0
+                                ? SpawnZeusUnit(record.className.c_str(), record.side, pastePosition, s_zeusHeading)
+                                : SpawnZeusVehicle(record.className.c_str(), pastePosition, s_zeusHeading);
+        pasted += placed ? 1 : 0;
+    }
+    s_zeusStatus = "Pasted " + std::to_string(pasted) + " Zeus object(s).";
+}
+
+void DrawZeusInteractionOverlay()
+{
+    if (!s_zeusCamera || !GEngine || !GScene)
+        return;
+
+    const Camera* camera = GScene->GetCamera();
+    if (!camera)
+        return;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    if (s_zeusLassoDrag)
+    {
+        // Track the engine cursor per frame rather than per SDL motion event:
+        // the engine cursor is integrated once per input tick, so the last
+        // event of a frame can still carry the previous tick's position.
+        const ZeusPoint cursor = ZeusCursorPixel();
+        s_zeusLassoEndX = cursor.x;
+        s_zeusLassoEndY = cursor.y;
+        const ImVec2 min = ZeusPixelToImGui(std::min(s_zeusLassoStartX, s_zeusLassoEndX),
+                                            std::min(s_zeusLassoStartY, s_zeusLassoEndY));
+        const ImVec2 max = ZeusPixelToImGui(std::max(s_zeusLassoStartX, s_zeusLassoEndX),
+                                            std::max(s_zeusLassoStartY, s_zeusLassoEndY));
+        draw->AddRectFilled(min, max, IM_COL32(80, 220, 255, 40));
+        draw->AddRect(min, max, IM_COL32(80, 220, 255, 255), 0.0f, 0, 1.5f);
+    }
+    PruneZeusRecords(s_zeusSelection);
+    for (const auto& record : s_zeusSelection)
+    {
+        ZeusPoint pixel;
+        if (!ZeusProjectToPixel(record.object->Position(), pixel))
+            continue;
+        const ImVec2 center = ZeusPixelToImGui(pixel.x, pixel.y);
+        const ImU32 selectionColor = IM_COL32(80, 220, 255, 255);
+        draw->AddCircle(center, 20.0f, selectionColor, 20, 2.0f);
+        draw->AddLine(center, ImVec2(center.x + 30.0f, center.y), selectionColor, 2.0f);
+        draw->AddTriangleFilled(ImVec2(center.x + 35.0f, center.y), ImVec2(center.x + 27.0f, center.y - 5.0f),
+                                ImVec2(center.x + 27.0f, center.y + 5.0f), selectionColor);
+    }
+}
+
+// Live weather and clock control for the Zeus tab.
+//
+// Everything here goes through DebugCheats rather than touching World or
+// Landscape directly, so the dev panel, the console commands and the tri
+// harness all drive the same code path. The sliders read back from the engine
+// every frame while they are not being dragged, so a value changed by a
+// mission script or by the console shows up here instead of the panel showing
+// a stale local copy.
+void DrawZeusWeatherAndTime(bool worldAvailable)
+{
+    // Engine-authored values, refreshed from the landscape unless the user is
+    // mid-drag on the corresponding widget.
+    static float overcast = 0.0f;
+    static float fog = 0.0f;
+    static float transition = 0.0f;
+    static float hour = 12.0f;
+    static bool editingOvercast = false;
+    static bool editingFog = false;
+    static bool editingHour = false;
+
+    // Both read back from the engine, so a value changed by a mission script or the
+    // console shows up here instead of the panel holding a stale local copy.
+    const Landscape* land = GLandscape;
+    if (land != nullptr)
+    {
+        if (!editingOvercast)
+            overcast = land->GetOvercast();
+        if (!editingFog)
+            fog = land->GetFog();
+    }
+    if (!editingHour)
+        hour = Glob.clock.GetTimeOfDay() * 24.0f;
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Weather and time");
+    ImGui::Separator();
+
+    const bool available = worldAvailable && DebugCheats::Cmd_SetWeather::Available();
+    ImGui::BeginDisabled(!available);
+
+    std::string out;
+    bool applyWeather = false;
+    applyWeather |= ImGui::SliderFloat("Overcast##zeus", &overcast, 0.0f, 1.0f, "%.2f");
+    editingOvercast = ImGui::IsItemActive();
+    ImGui::SetItemTooltip("0 = clear, 1 = fully overcast. Drives cloud cover and the sky's light.");
+
+    applyWeather |= ImGui::SliderFloat("Fog##zeus", &fog, 0.0f, 1.0f, "%.2f");
+    editingFog = ImGui::IsItemActive();
+    ImGui::SetItemTooltip("0 = clear, 1 = thickest. Independent of overcast — the console 'weather' "
+                          "command and triCheatWeather both force this to 0, this slider does not.");
+
+    ImGui::SliderFloat("Transition (s)##zeus", &transition, 0.0f, 600.0f, "%.0f");
+    ImGui::SetItemTooltip("0 applies the change on the next frame. Anything higher lets the engine "
+                          "interpolate, which is what you want while someone is watching.");
+
+    if (applyWeather)
+    {
+        DebugCheats::Cmd_SetWeather::InvokeWeather(overcast, fog, transition, out);
+        s_zeusStatus = out;
+    }
+
+    // Presets are the common case: nobody wants to hunt for 0.75 on a slider.
+    ImGui::TextDisabled("  Presets");
+    ImGui::SameLine();
+    const struct
+    {
+        const char* label;
+        float overcast;
+        float fog;
+    } presets[] = {
+        {"Clear", 0.0f, 0.0f},  {"Cloudy", 0.5f, 0.05f}, {"Overcast", 0.85f, 0.10f},
+        {"Storm", 1.0f, 0.25f}, {"Foggy", 0.3f, 0.8f},
+    };
+    ImGui::PushID("zeus_weather_presets");
+    for (const auto& preset : presets)
+    {
+        if (ImGui::SmallButton(preset.label))
+        {
+            overcast = preset.overcast;
+            fog = preset.fog;
+            DebugCheats::Cmd_SetWeather::InvokeWeather(overcast, fog, transition, out);
+            s_zeusStatus = out;
+        }
+        ImGui::SameLine();
+    }
+    ImGui::PopID();
+    ImGui::NewLine();
+
+    ImGui::Spacing();
+    // The clock is display-only until released: the engine only offers a
+    // relative skip, so applying every frame of a drag would fire dozens of
+    // skips and sail past the target.
+    ImGui::SliderFloat("Time of day##zeus", &hour, 0.0f, 24.0f, "%05.2f h");
+    const bool hourActive = ImGui::IsItemActive();
+    const bool hourReleased = editingHour && !hourActive;
+    editingHour = hourActive;
+    ImGui::SetItemTooltip("Applied when you release the slider, not while dragging. The engine only "
+                          "offers a relative skip, so the clock moves FORWARD to the requested hour "
+                          "— asking for an earlier time wraps through midnight.");
+    if (hourReleased && DebugCheats::Cmd_SetTimeOfDay::Available())
+    {
+        DebugCheats::Cmd_SetTimeOfDay::InvokeHour(hour, out);
+        s_zeusStatus = out;
+    }
+
+    ImGui::TextDisabled("  Jump to");
+    ImGui::SameLine();
+    const struct
+    {
+        const char* label;
+        float hour;
+    } times[] = {
+        {"Dawn", 5.5f}, {"Morning", 9.0f}, {"Noon", 12.0f}, {"Dusk", 19.0f}, {"Night", 23.0f},
+    };
+    ImGui::PushID("zeus_time_presets");
+    for (const auto& time : times)
+    {
+        if (ImGui::SmallButton(time.label))
+        {
+            hour = time.hour;
+            DebugCheats::Cmd_SetTimeOfDay::InvokeHour(hour, out);
+            s_zeusStatus = out;
+        }
+        ImGui::SameLine();
+    }
+    ImGui::PopID();
+    ImGui::NewLine();
+
+    float multiplier = DebugCheats::Cmd_TimeMultiplier::Get();
+    if (ImGui::SliderFloat("Time scale##zeus", &multiplier, 0.1f, 60.0f, "%.1fx", ImGuiSliderFlags_Logarithmic))
+    {
+        DebugCheats::Cmd_TimeMultiplier::SetValue(multiplier, out);
+        s_zeusStatus = out;
+    }
+    ImGui::SetItemTooltip("How fast the world clock runs. The engine clamps this to its own range, "
+                          "and the value shown is read back from the engine, so what you see is what "
+                          "it accepted.");
+
+    ImGui::EndDisabled();
+}
+
+void DrawZeusTab()
+{
+    const bool worldAvailable = ZeusWorldAvailable();
+    ImGui::TextUnformatted("Zeus Mode");
+    ImGui::SameLine();
+    ImGui::TextDisabled("native free-fly camera and live spawning");
+    ImGui::Separator();
+
+    ImGui::BeginDisabled(!worldAvailable);
+    if (!s_zeusCamera)
+    {
+        if (ImGui::Button("Enable free-fly"))
+            EnableZeusCamera();
+    }
+    else if (ImGui::Button("Exit free-fly"))
+        DisableZeusCamera();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("WASD moves, Q/Z changes altitude, and the mouse looks around.\nKeypad +/- changes zoom.");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Spawn at camera aim");
+    ImGui::Separator();
+    ImGui::BeginDisabled(!worldAvailable);
+    if (ImGui::RadioButton("Unit", s_zeusSpawnKind == 0))
+    {
+        s_zeusSpawnKind = 0;
+        s_zeusPreset = 0;
+        SetZeusClassFromPreset();
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Vehicle", s_zeusSpawnKind == 1))
+    {
+        s_zeusSpawnKind = 1;
+        s_zeusPreset = 0;
+        SetZeusClassFromPreset();
+    }
+
+    const auto presetName = [&]() -> const char*
+    {
+        return s_zeusSpawnKind == 0
+                   ? kZeusUnitPresets[std::clamp(s_zeusPreset, 0, static_cast<int>(kZeusUnitPresets.size()) - 1)]
+                   : kZeusVehiclePresets[std::clamp(s_zeusPreset, 0, static_cast<int>(kZeusVehiclePresets.size()) - 1)];
+    };
+    if (ImGui::BeginCombo("Preset", presetName()))
+    {
+        const int count = s_zeusSpawnKind == 0 ? static_cast<int>(kZeusUnitPresets.size())
+                                               : static_cast<int>(kZeusVehiclePresets.size());
+        for (int i = 0; i < count; ++i)
+        {
+            const char* name = s_zeusSpawnKind == 0 ? kZeusUnitPresets[i] : kZeusVehiclePresets[i];
+            if (ImGui::Selectable(name, s_zeusPreset == i))
+            {
+                s_zeusPreset = i;
+                SetZeusClassFromPreset();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (s_zeusSpawnKind == 0)
+        ImGui::Combo("Side", &s_zeusSide, kZeusSideNames.data(), static_cast<int>(kZeusSideNames.size()));
+    ImGui::InputText("Config class", s_zeusClassName, sizeof(s_zeusClassName));
+    ImGui::SetItemTooltip("Any loaded CfgVehicles class can be entered here. Presets use original CWA class names.");
+    ImGui::SliderFloat("Distance (m)", &s_zeusDistance, 2.0f, 250.0f, "%.0f");
+    ImGui::SliderFloat("Heading (deg)", &s_zeusHeading, 0.0f, 359.0f, "%.0f");
+    ImGui::SetItemTooltip("Sets the facing direction before spawning. This is safer than changing a live AI unit.");
+    ImGui::SliderInt("Count", &s_zeusCount, 1, 32);
+    if (ImGui::Button("Spawn"))
+        Defer([] { SpawnZeusSelection(); });
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!s_zeusCamera);
+    if (ImGui::Button(s_zeusClickPlacement ? "Stop click placement" : "Place with clicks"))
+    {
+        s_zeusClickPlacement = !s_zeusClickPlacement;
+        s_zeusStatus = s_zeusClickPlacement
+                           ? "Click placement armed. Close the panel and left-click the crosshair target to place more."
+                           : "Click placement stopped.";
+        if (s_zeusClickPlacement && s_zeusCamera)
+            SetVisible(false);
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Zeus-spawned object editing");
+    ImGui::Separator();
+    ImGui::BeginDisabled(!s_zeusCamera);
+    if (ImGui::Button("Select under cursor"))
+        Defer(
+            []
+            {
+                const ZeusPoint cursor = ZeusCursorPixel();
+                SelectZeusAtCursor(cursor.x, cursor.y);
+            });
+    ImGui::SameLine();
+    if (ImGui::Button("Select all Zeus objects"))
+        Defer(
+            []
+            {
+                PruneZeusRecords(s_zeusSpawned);
+                s_zeusSelection = s_zeusSpawned;
+                s_zeusStatus = "Selected " + std::to_string(s_zeusSelection.size()) + " Zeus object(s).";
+            });
+    ImGui::TextDisabled("Selected: %d", static_cast<int>(s_zeusSelection.size()));
+    ImGui::TextDisabled("With a selection: wheel raises/lowers (Shift = 5m), Shift+drag rotates,");
+    ImGui::TextDisabled("Ctrl+C / Ctrl+V copies at the cursor, Delete removes.");
+    ImGui::BeginDisabled(s_zeusSelection.empty());
+    if (ImGui::Button("Rotate selected to heading"))
+        Defer([] { RotateZeusSelection(); });
+    ImGui::SameLine();
+    if (ImGui::Button("Delete selected"))
+        Defer([] { DeleteZeusSelection(); });
+    if (ImGui::Button("Copy selected"))
+    {
+        s_zeusClipboard = s_zeusSelection;
+        s_zeusStatus = "Copied " + std::to_string(s_zeusClipboard.size()) + " Zeus object(s).";
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(s_zeusClipboard.empty());
+    if (ImGui::Button("Paste at crosshair"))
+        Defer(
+            []
+            {
+                Vector3 position;
+                if (!ZeusClickPosition(position))
+                {
+                    s_zeusStatus = "No terrain was under the Zeus crosshair.";
+                    return;
+                }
+                int pasted = 0;
+                for (int i = 0; i < static_cast<int>(s_zeusClipboard.size()); ++i)
+                {
+                    const auto& record = s_zeusClipboard[i];
+                    Vector3 pastePosition = position + s_zeusCamera->DirectionAside() * (static_cast<float>(i) * 4.0f);
+                    pastePosition[1] = GLandscape->RoadSurfaceYAboveWater(pastePosition[0], pastePosition[2]);
+                    const bool placed =
+                        record.kind == 0
+                            ? SpawnZeusUnit(record.className.c_str(), record.side, pastePosition, s_zeusHeading)
+                            : SpawnZeusVehicle(record.className.c_str(), pastePosition, s_zeusHeading);
+                    pasted += placed ? 1 : 0;
+                }
+                s_zeusStatus = "Pasted " + std::to_string(pasted) + " Zeus object(s).";
+            });
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+
+    DrawZeusWeatherAndTime(worldAvailable);
+
+    if (!worldAvailable)
+        ImGui::TextDisabled("Load a mission or world to use Zeus.");
+    if (!s_zeusStatus.empty())
+    {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", s_zeusStatus.c_str());
+    }
 }
 
 // One mutable copy per (slot, role) shown by the tuner.  Pulled from the
@@ -701,6 +1712,47 @@ void DrawInputContextDiagnostics()
 
 void DrawGameTab()
 {
+    // Player/camera position, with a copy button. Reading coordinates out of the
+    // SQF console meant `getPos player`, which returns an array — and until the
+    // formatter above, arrays printed as nothing. A readout is also simply less
+    // work than typing a command to answer "where am I".
+    ImGui::TextUnformatted("Position");
+    ImGui::Separator();
+    if (GWorld && GWorld->CameraOn())
+    {
+        char line[192] = {};
+        const Object* player = GWorld->PlayerOn();
+        const Object* cam = GWorld->CameraOn();
+        if (player)
+        {
+            const Vector3 p = player->Position();
+            // Reported as SQF sees it: [east, north, elevation]. mission.sqm
+            // stores {east, elevation, north}, and mixing the two up is an easy
+            // way to place something a long way from where it was meant to go.
+            // Heading the same way getDir does it: atan2(dir.x, dir.z) in degrees,
+            // wrapped to [0,360) so it matches what the console reports.
+            const Vector3 d = player->Direction();
+            float heading = atan2(d.X(), d.Z()) * (180.0f / H_PI);
+            if (heading < 0.0f)
+                heading += 360.0f;
+            snprintf(line, sizeof(line), "player [%.2f, %.2f, %.2f]  dir %.2f", p.X(), p.Z(), p.Y(), heading);
+        }
+        else
+        {
+            const Vector3 p = cam->Position();
+            snprintf(line, sizeof(line), "camera [%.2f, %.2f, %.2f]  (no player)", p.X(), p.Z(), p.Y());
+        }
+        ImGui::TextUnformatted(line);
+        ImGui::SameLine();
+        if (ImGui::Button("Copy##pos"))
+            ImGui::SetClipboardText(line);
+    }
+    else
+    {
+        ImGui::TextDisabled("no world loaded");
+    }
+    ImGui::Spacing();
+
     ImGui::TextUnformatted("Language");
     ImGui::Separator();
 
@@ -785,6 +1837,27 @@ void ConsoleAppend(const std::string& line)
                                    s_console.scrollback.begin() + (s_console.scrollback.size() - 200));
 }
 
+// GameValue::GetText() renders an array as nothing, so `getPos player` came back
+// blank and the console could not report a position at all. Format arrays
+// recursively instead; scalars keep GetText's own formatting.
+std::string FormatConsoleValue(const GameValue& value)
+{
+    if (value.GetType() == GameArray)
+    {
+        const GameArrayType& items = value;
+        std::string out = "[";
+        for (int i = 0; i < items.Size(); ++i)
+        {
+            if (i != 0)
+                out += ", ";
+            out += FormatConsoleValue(items[i]);
+        }
+        return out + "]";
+    }
+    const char* text = static_cast<const char*>(value.GetText());
+    return text ? std::string(text) : std::string();
+}
+
 void ConsoleRun(std::string_view line)
 {
     while (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
@@ -818,7 +1891,7 @@ void ConsoleRun(std::string_view line)
     }
     GameValue result = GWorld->GetGameState()->EvaluateMultiple(std::string(line).c_str());
     if (result.GetType() != GameNothing)
-        ConsoleAppend(std::string("= ") + (const char*)result.GetText());
+        ConsoleAppend(std::string("= ") + FormatConsoleValue(result));
 }
 } // namespace
 
@@ -917,6 +1990,23 @@ void DrawProfileTab()
     const float ms = ProfileFrameMs();
     ImGui::Text("FPS:   %.1f", fps);
     ImGui::Text("Frame: %.2f ms", ms);
+    if (GEngine)
+    {
+        // Keep the selected renderer visible in the always-available Profile
+        // tab. This is intentionally sourced from the live engine rather than
+        // the requested command-line backend, which can differ after a
+        // fallback or a failed backend construction.
+        ImGui::Text("Renderer: %s", static_cast<const char*>(GEngine->GetRendererName()));
+        ImGui::TextDisabled("Runtime: %s", static_cast<const char*>(GEngine->GetDebugName()));
+        const uint32_t caps = GEngine->GetRuntimeCapabilityFlags();
+        if (caps)
+        {
+            ImGui::TextDisabled("Capabilities: BC=%s bindless=%s timestamps=%s in-pass=%s HDR=%s MSAA=%s",
+                                (caps & (1u << 0)) ? "yes" : "no", "yes", (caps & (1u << 4)) ? "yes" : "no",
+                                (caps & (1u << 5)) ? "yes" : "no", (caps & (1u << 6)) ? "yes" : "no",
+                                (caps & (1u << 7)) ? "yes" : "no");
+        }
+    }
 
     // Frame-time plot.  PlotLines is fine for ring-buffered floats;
     // ImGui handles the visual stride.  Y-axis fixed 0..50 ms (~20fps
@@ -1183,17 +2273,38 @@ void ApplyDevPanelMouseState()
 {
     if (!GEngine)
         return;
-    if (s_visible && !s_mouseReleasedByPanel)
+    const bool overlayOwnsMouse = s_visible || s_zeusCamera;
+    if (overlayOwnsMouse && !s_mouseReleasedByPanel)
     {
         s_savedMouseGrab = GEngine->IsMouseGrabbed();
-        GEngine->SetMouseGrab(false);
         s_mouseReleasedByPanel = true;
     }
-    else if (!s_visible && s_mouseReleasedByPanel)
+
+    if (overlayOwnsMouse)
+    {
+        // Panel open: the OS pointer must be free, both to reach ImGui widgets
+        // and to drag-resize the window.
+        //
+        // Panel hidden with Zeus active: grab.  Zeus resolves every position
+        // from the engine's own cursor sprite (see ZeusCursorPixel), never from
+        // absolute SDL coordinates, so relative mouse mode is exactly what that
+        // cursor wants — it cannot stall against the window edge, and SDL keeps
+        // the desktop pointer hidden while it is engaged.
+        GEngine->SetMouseGrab(!s_visible);
+    }
+    else if (s_mouseReleasedByPanel)
     {
         GEngine->SetMouseGrab(s_savedMouseGrab);
         s_mouseReleasedByPanel = false;
     }
+
+    // SDL can still restore the desktop pointer across focus transitions, so
+    // assert the intended state explicitly: the focused game viewport must show
+    // one cursor, not the OS cursor over the game's cursor sprite.
+    if (s_visible)
+        SDL_ShowCursor();
+    else if (s_zeusCamera)
+        SDL_HideCursor();
 }
 
 // Resize the window to the largest box of the given aspect ratio that fits
@@ -1325,6 +2436,431 @@ void DrawAspectTab()
     }
 }
 
+void DrawGrassTab()
+{
+    if (!GEngine)
+    {
+        ImGui::TextDisabled("No engine.");
+        return;
+    }
+
+    struct GrassMapChoice
+    {
+        const char* label;
+        const char* worldKey;
+    };
+    // CWA's legacy internal world names differ from their displayed island
+    // names: Eden is Everon, Abel is Malden, Cain is Kolgujev, and Noe is
+    // Nogova. Keep both names visible so this tool works with the actual
+    // installed WRP files, not a guessed display name.
+    static constexpr GrassMapChoice maps[] = {
+        {"Intro", "Intro"},          {"Everon (Eden)", "Eden"}, {"Malden (Abel)", "Abel"},
+        {"Kolgujev (Cain)", "Cain"}, {"Nogova (Noe)", "Noe"},
+    };
+    static int selectedMap = 0;
+    static int selectedSurface = 0;
+    static std::string observedWorld;
+
+    // The mission header can remain on the intro world while an in-game map
+    // has already switched. TerrainWgpu records the actual WRP it uploaded,
+    // which is the only name safe to use for grass layer selection.
+    const char* loadedMapName = GEngine->GetGrassLoadedMapName();
+    const std::string activeMapFile = loadedMapName && *loadedMapName ? loadedMapName : Glob.header.worldname;
+    std::string activeWorld = activeMapFile;
+    const size_t lastSlash = activeWorld.find_last_of("\\/");
+    if (lastSlash != std::string::npos)
+        activeWorld.erase(0, lastSlash + 1);
+    const size_t extension = activeWorld.find_last_of('.');
+    if (extension != std::string::npos)
+        activeWorld.erase(extension);
+    if (activeWorld != observedWorld)
+    {
+        observedWorld = activeWorld;
+        selectedSurface = 0;
+        for (int i = 0; i < static_cast<int>(std::size(maps)); ++i)
+        {
+            if (strcmpi(activeWorld.c_str(), maps[i].worldKey) == 0)
+            {
+                selectedMap = i;
+                break;
+            }
+        }
+    }
+
+    Engine::GrassSettings grass = GEngine->GetGrassSettings();
+    bool changed = false;
+
+    ImGui::TextUnformatted("Map and terrain surface");
+    ImGui::SetNextItemWidth(220.0f);
+    if (ImGui::BeginCombo("Map", maps[selectedMap].label))
+    {
+        for (int i = 0; i < static_cast<int>(std::size(maps)); ++i)
+        {
+            const bool selected = selectedMap == i;
+            if (ImGui::Selectable(maps[i].label, selected))
+                selectedMap = i;
+            if (selected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    const bool selectedMapLoaded = strcmpi(activeWorld.c_str(), maps[selectedMap].worldKey) == 0;
+    ImGui::SameLine();
+    const bool canSwitchMap = GWorld != nullptr && GWorld->GetMode() == GModeIntro;
+    bool loadMap = false;
+    if (canSwitchMap)
+    {
+        ImGui::BeginDisabled(selectedMapLoaded);
+        loadMap = ImGui::Button("Load selected map");
+        ImGui::EndDisabled();
+    }
+    else if (!selectedMapLoaded && GWorld != nullptr)
+    {
+        loadMap = ImGui::Button("Force-load selected map (dev)");
+    }
+    if (loadMap)
+    {
+        // Resolve through CfgWorlds. This is the same authoritative mapping as
+        // mission loading and handles modded/relocated WRP paths correctly.
+        const RString resolvedWorld = GetWorldName(maps[selectedMap].worldKey);
+        const std::string worldFile = static_cast<const char*>(resolvedWorld);
+        SetVisible(false);
+        // Landscape switching invalidates textures and the scene, so do it only
+        // after ImGui has finished this frame, exactly like the reload control.
+        Defer(
+            [worldFile]
+            {
+                if (GWorld != nullptr)
+                    GWorld->SwitchLandscape(worldFile.c_str());
+            });
+    }
+    ImGui::TextDisabled("Active terrain WRP: %s. Everon uses the internal name Eden.", activeMapFile.c_str());
+    const RString selectedWorldFile = GetWorldName(maps[selectedMap].worldKey);
+    ImGui::TextDisabled("Selected WRP: %s", static_cast<const char*>(selectedWorldFile));
+    if (!canSwitchMap && !selectedMapLoaded)
+        ImGui::TextDisabled("Force-load replaces the active mission landscape; use it only for grass testing.");
+
+    // The terrain combo is deliberately separate from the map combo. It always
+    // comes from the loaded map, so an Everon selection cannot accidentally
+    // apply Eden layer indices to the active geography texture.
+    const int surfaceCount = GEngine->GetGrassSurfaceCount();
+    if (surfaceCount == 0)
+    {
+        ImGui::TextDisabled("Loading map terrain materials...");
+    }
+    else
+    {
+        selectedSurface = std::clamp(selectedSurface, 0, surfaceCount - 1);
+        ImGui::SetNextItemWidth(390.0f);
+        if (ImGui::BeginCombo("Terrain surface", GEngine->GetGrassSurfaceName(selectedSurface)))
+        {
+            for (int i = 0; i < surfaceCount; ++i)
+            {
+                const bool selected = selectedSurface == i;
+                char label[512];
+                snprintf(label, sizeof(label), "%d: %s", i, GEngine->GetGrassSurfaceName(i));
+                if (ImGui::Selectable(label, selected))
+                    selectedSurface = i;
+                if (selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        bool selectedEnabled = GEngine->IsGrassSurfaceEnabled(selectedSurface);
+        if (ImGui::Checkbox("Spawn on selected terrain", &selectedEnabled))
+            GEngine->SetGrassSurfaceEnabled(selectedSurface, selectedEnabled);
+        ImGui::SameLine();
+        if (ImGui::Button("Use selected only"))
+        {
+            for (int i = 0; i < surfaceCount; ++i)
+                GEngine->SetGrassSurfaceEnabled(i, i == selectedSurface);
+        }
+        if (ImGui::Button("Clear all surfaces"))
+        {
+            for (int i = 0; i < surfaceCount; ++i)
+                GEngine->SetGrassSurfaceEnabled(i, false);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Enable all surfaces"))
+        {
+            for (int i = 0; i < surfaceCount; ++i)
+                GEngine->SetGrassSurfaceEnabled(i, true);
+        }
+        ImGui::TextDisabled(
+            "Select a material, then toggle it. The selector contains every terrain layer of this map.");
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("GPU-generated terrain blades. Placement follows the terrain grass pass and excludes water, "
+                        "roads, forests and buildings.");
+    ImGui::Separator();
+    changed |= ImGui::Checkbox("Enabled", &grass.enabled);
+    changed |= ImGui::Checkbox("Cast close grass shadows", &grass.castShadows);
+    changed |= ImGui::Checkbox("Apply grass distance fog", &grass.applyFog);
+    ImGui::TextDisabled("Both are grass-only visual controls; turn either off to inspect the procedural field.");
+    changed |= ImGui::Checkbox("Ignore terrain exclusions (diagnostic)", &grass.ignoreGeographyExclusions);
+    ImGui::TextDisabled("Relaxes only the FOREST flags, which some legacy Everon WRPs set across ordinary ground. "
+                        "Water, roads, tracks and buildings stay excluded either way -- there is no setting that "
+                        "puts grass on a road.");
+    changed |= ImGui::SliderFloat("Coverage", &grass.density, 0.05f, 1.0f, "%.2f");
+    ImGui::TextDisabled("Retained fraction of procedural candidate blades. 1.00 uses every candidate.");
+    changed |= ImGui::SliderFloat("Density boost", &grass.densityBoost, 1.0f, 4.0f, "%.1fx");
+    ImGui::TextDisabled("Raises density beyond the base grid. Very high values reduce the maximum usable radius.");
+    changed |= ImGui::SliderFloat("Base spacing (m)", &grass.spacing, 0.10f, 0.75f, "%.2f");
+    ImGui::TextDisabled(
+        "Distance between candidates before the density boost; lower values make grass substantially denser.");
+    changed |= ImGui::SliderFloat("Detail radius (m)", &grass.radius, 8.0f, 200.0f, "%.0f");
+    ImGui::TextDisabled("Dense cards plus the mid blade ring. Both are bounded by their placement grids, so values "
+                        "past ~64 m have no further effect.");
+    changed |= ImGui::SliderFloat("Far radius (m)", &grass.farRadius, 0.0f, 5000.0f, "%.0f");
+    ImGui::TextDisabled("Outer terrain-cover proxy. 0 = off (grass ends at the mid ring). Any other value is floored "
+                        "past the mid ring, and its dispatch is skipped entirely when off.");
+    changed |= ImGui::SliderFloat("Density noise scale", &grass.densityNoiseScale, 0.002f, 0.5f, "%.3f");
+    ImGui::TextDisabled(
+        "Patch frequency in 1/metres. 0.075 gives ~13 m patches; lower = broader sweeps, higher = finer mottling.");
+    changed |= ImGui::SliderFloat("Density noise strength", &grass.densityNoiseStrength, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("0 = perfectly uniform coverage; 1 = bare ground between dense clumps. Scaled by Field "
+                        "clumping below, and does not affect the far ring.");
+
+    changed |= ImGui::SliderFloat("Colour saturation", &grass.saturation, 0.0f, 2.0f, "%.2f");
+    ImGui::TextDisabled("1.00 = untouched, 0.00 = greyscale. Pushed about the luma axis, so brightness is "
+                        "unchanged -- this pulls colour out without darkening. Applies to near blades, mid "
+                        "ribbons/clump cards and the far proxy together.");
+    changed |= ImGui::SliderFloat("Dry patches", &grass.dryPatches, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("Fraction of the field that bleaches toward dry straw. 0 = uniformly green. Tips dry "
+                        "before roots, and it uses its own noise field so dry ground does not line up with "
+                        "thin ground.");
+    changed |= ImGui::SliderFloat("Dry patch size", &grass.dryPatchScale, 0.002f, 0.3f, "%.3f");
+    ImGui::TextDisabled("Noise frequency in 1/metres: 0.03 gives ~33 m patches, higher values break the field "
+                        "into smaller dry spots.");
+    changed |= ImGui::SliderFloat("Blade width", &grass.bladeWidth, 0.25f, 6.0f, "%.2fx");
+    ImGui::TextDisabled("1.00 = the long-standing look. The near-LOD blade texture only becomes visible above "
+                        "roughly 3x: a stock 3 cm blade is about 4 pixels wide on screen, and a 64-pixel-wide "
+                        "texture is averaged down to flat colour before it is ever drawn. Wider blades read as "
+                        "broad leaves rather than fine grass, so this is a look choice, not a fix.");
+
+    changed |= ImGui::Checkbox("Mid LOD: photographed tuft cards", &grass.midPhotoTuft);
+    ImGui::TextDisabled("Off = procedural crossed ribbons (default). On = crossed cards using the game's own "
+                        "trava1_pmp2 texture; that 2001 photo is grey-teal rather than green, so it needs "
+                        "colour correction to sit right next to the near grass.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Blade shape");
+    changed |= ImGui::SliderFloat("Shape variety", &grass.shapeVariety, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("0 = the legacy look, where all FOUR grass species shared one silhouette and the field "
+                        "read as the same blade repeated. 1 = eight distinct width/height/taper profiles. This "
+                        "is geometry, not texture, so it costs nothing either way.");
+    changed |= ImGui::SliderFloat("Taper jitter", &grass.taperJitter, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("Per-blade spread on the taper exponent, so neighbouring blades of the same species do "
+                        "not narrow identically. Multiplicative about 1.0: 0 leaves the chosen profile alone "
+                        "rather than shifting it.");
+    changed |= ImGui::SliderFloat("Arch", &grass.bladeArch, 0.0f, 3.0f, "%.2f");
+    ImGui::TextDisabled("How far a blade arcs over, as a multiple of its own height. 0 = rigid spikes standing "
+                        "to attention, which is what the stock bend gave: it moved a tip 5-19 cm on a ~0.8 m "
+                        "blade, about ten degrees. Taller blades arc further, so this scales with height rather "
+                        "than being a fixed distance. Costs nothing -- it is a vertex-shader curve.");
+    changed |= ImGui::SliderFloat("Bend jitter", &grass.bendJitter, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("Per-blade spread on the resting lean. Also multiplicative about the stock range, so "
+                        "turning it up widens the spread in both directions instead of leaning the whole field "
+                        "further over.");
+    changed |= ImGui::SliderFloat("Photo texture strength", &grass.bladeTextureStrength, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("Scales the near-LOD photo atlas on top of its distance fade. 0 keeps the procedural "
+                        "surface even when photo layers are installed -- the quickest way to tell whether a look "
+                        "problem is the texture or the geometry. No effect when no photo atlas is loaded.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Alpha cut-out cards (experimental)");
+    changed |= ImGui::Checkbox("Silhouette from texture alpha", &grass.alphaCards);
+    ImGui::TextDisabled("Off = the blade outline is geometry (default). On = the quad is widened and the outline "
+                        "is cut out of the texture's alpha, so one card can carry several blade shapes. This is "
+                        "the Reforger-style approach and it buys shape variety without more geometry -- but it "
+                        "discards, which loses the early-Z the solid path relies on, and the wider quad adds "
+                        "overdraw. Watch the Grass rows in the benchmark table when turning it on.");
+    changed |= ImGui::SliderFloat("Alpha cutoff", &grass.alphaCutoff, 0.05f, 0.95f, "%.2f");
+    ImGui::TextDisabled("Texels below this alpha are discarded. Lower keeps more of the blade and its soft edge; "
+                        "higher trims harder and thins the silhouette. Only used when cards are on.");
+    changed |= ImGui::SliderFloat("Card widening", &grass.cardWiden, 1.0f, 4.0f, "%.2fx");
+    ImGui::TextDisabled("How much wider the quad is than the blade it draws. The cutout needs material to "
+                        "remove: at 1.00x there is nothing spare and the card reads as a rectangle again. "
+                        "Directly proportional to the overdraw this path costs.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Species mix");
+    changed |= ImGui::SliderFloat("Weed %", &grass.weedPercent, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("Broad flat leaves (clover, ragged weed). Wider and shorter than grass.");
+    changed |= ImGui::SliderFloat("Flower %", &grass.flowerPercent, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("Daisy and poppy heads on slim untapered stems. Clamped so weed + flower never exceeds 100%%.");
+    // Mirror the renderer's clamp so the readout cannot claim an impossible mix.
+    {
+        const float weed = std::clamp(grass.weedPercent, 0.0f, 1.0f);
+        const float flower = std::clamp(grass.flowerPercent, 0.0f, 1.0f - weed);
+        ImGui::TextDisabled("Effective mix: %.0f%% grass, %.0f%% weed, %.0f%% flower. Chosen per clump (~25 m "
+                            "patches), so these are area fractions, not per-blade odds.",
+                            (1.0f - weed - flower) * 100.0f, weed * 100.0f, flower * 100.0f);
+    }
+    changed |= ImGui::SliderFloat("Blade height", &grass.height, 0.10f, 3.0f, "%.2fx");
+    changed |= ImGui::Checkbox("Use live world wind", &grass.useLiveWind);
+    changed |= ImGui::SliderFloat("Wind strength", &grass.windStrength, 0.0f, 3.0f, "%.2f");
+    changed |= ImGui::SliderFloat("Wind direction", &grass.windDirection, -180.0f, 180.0f, "%.0f deg");
+    ImGui::TextDisabled(
+        "Live wind follows weather. Disable it to test a manual direction; 0 degrees points east (+X).");
+    changed |= ImGui::SliderFloat("Field clumping", &grass.clumping, 0.0f, 1.0f, "%.2f");
+    changed |= ImGui::SliderFloat("Colour variation", &grass.colorVariation, 0.0f, 1.0f, "%.2f");
+    changed |= ImGui::SliderFloat("Backlight transmission", &grass.transmission, 0.0f, 1.0f, "%.2f");
+    const float effectiveSpacing = std::max(0.10f, grass.spacing / std::sqrt(std::max(1.0f, grass.densityBoost)));
+    const float nearDetailRadius = std::min(grass.radius, effectiveSpacing * 255.0f);
+    const float midReach = std::min(160.0f, std::max(nearDetailRadius + 10.0f, nearDetailRadius * 2.5f));
+    if (grass.farRadius <= 0.0f)
+        ImGui::TextDisabled("LOD field: detailed %.0f m, mid blades to %.0f m, no far ring.", nearDetailRadius,
+                            midReach);
+    else
+    {
+        const float farReach = std::clamp(grass.farRadius, midReach + 8.0f, 5000.0f);
+        ImGui::TextDisabled("LOD field: detailed %.0f m, mid blades to %.0f m, far cover %.0f-%.0f m.",
+                            nearDetailRadius, midReach, midReach, farReach);
+    }
+    ImGui::TextDisabled("Wind: travelling direction field plus local gusts; roots stay pinned and player/vehicle "
+                        "tracks persist for one minute.");
+
+    ImGui::Separator();
+    if (ImGui::Button("Reset ultra dense"))
+    {
+        grass = Engine::GrassSettings{};
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Ultra dense"))
+    {
+        grass.enabled = true;
+        grass.density = 1.0f;
+        grass.densityBoost = 4.0f;
+        grass.spacing = 0.20f;
+        grass.radius = 30.0f;
+        grass.farRadius = 1.0f;
+        grass.densityNoiseScale = 0.075f;
+        grass.densityNoiseStrength = 0.55f;
+        grass.bladeWidth = 1.0f;
+        grass.saturation = 0.78f;
+        grass.dryPatches = 0.35f;
+        grass.dryPatchScale = 0.030f;
+        grass.weedPercent = 0.12f;
+        grass.flowerPercent = 0.05f;
+        grass.shapeVariety = 1.0f;
+        grass.taperJitter = 0.35f;
+        grass.bendJitter = 0.30f;
+        grass.bladeTextureStrength = 1.0f;
+        grass.alphaCards = false;
+        grass.alphaCutoff = 0.5f;
+        grass.cardWiden = 1.6f;
+        grass.bladeArch = 1.0f;
+        grass.height = 1.25f;
+        grass.useLiveWind = true;
+        grass.windStrength = 1.2f;
+        grass.clumping = 0.55f;
+        grass.colorVariation = 0.35f;
+        grass.transmission = 0.10f;
+        grass.castShadows = true;
+        grass.applyFog = true;
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Disable"))
+    {
+        grass.enabled = false;
+        changed = true;
+    }
+
+    if (changed)
+        GEngine->SetGrassSettings(grass);
+
+    // GRS-A — grass benchmark panel, mirroring the Water tab's WTR-002 table.
+    // Both GPU timings and instance counts are harvested asynchronously, so they
+    // lag the displayed frame by the readback ring depth (~2-3 frames).
+    ImGui::Separator();
+    ImGui::TextUnformatted("Benchmark (GRS-A)");
+
+    Engine::GrassStatsOut stats;
+    if (GEngine->GetGrassStats(stats) &&
+        ImGui::BeginTable("grsCounts", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+    {
+        ImGui::TableSetupColumn("LOD");
+        ImGui::TableSetupColumn("instances");
+        ImGui::TableSetupColumn("candidates");
+        ImGui::TableSetupColumn("accepted");
+        ImGui::TableSetupColumn("vertices");
+        ImGui::TableHeadersRow();
+        struct Row
+        {
+            const char* name;
+            unsigned instances, candidates, vertices;
+        };
+        const Row rows[] = {
+            {"Near", stats.nearInstances, stats.nearCandidates, stats.nearVertices},
+            {"Mid", stats.midInstances, stats.midCandidates, stats.midVertices},
+            {"Far", stats.farInstances, stats.farCandidates, stats.farVertices},
+        };
+        unsigned totalInstances = 0, totalVertices = 0;
+        for (const Row& r : rows)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(r.name);
+            ImGui::TableNextColumn();
+            ImGui::Text("%u", r.instances);
+            ImGui::TableNextColumn();
+            ImGui::Text("%u", r.candidates);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.2f%%", r.candidates ? 100.0 * r.instances / r.candidates : 0.0);
+            ImGui::TableNextColumn();
+            ImGui::Text("%u", r.vertices);
+            totalInstances += r.instances;
+            totalVertices += r.vertices;
+        }
+        ImGui::EndTable();
+        ImGui::Text("Total: %u instances, %u vertices submitted", totalInstances, totalVertices);
+        ImGui::SetItemTooltip("Vertices are the geometry the colour pass submits. The prepass "
+                              "re-submits near+mid, and the shadow pass re-submits near, so the "
+                              "frame's true grass vertex load is higher than this row.");
+        if (stats.farInstances == 0 && grass.farRadius > 0.0f)
+            ImGui::TextDisabled("Far ring is on but empty — check geography exclusions for this map.");
+    }
+
+    float gpuMs[32];
+    const int gpuRegions = GEngine->GetWaterGpuTimings(gpuMs, 32);
+    if (gpuRegions <= 0)
+    {
+        ImGui::TextDisabled("GPU timings unavailable (adapter lacks TIMESTAMP_QUERY / non-wgpu backend).");
+    }
+    else if (ImGui::BeginTable("grsGpuTimings", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+    {
+        float gpuTotal = 0.0f;
+        const int last = std::min(gpuRegions, (int)Engine::kGrassGpuRegionEnd);
+        for (int i = (int)Engine::kGrassGpuRegionBegin; i < last; ++i)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(GEngine->GetWaterGpuTimingName(i));
+            ImGui::TableNextColumn();
+            if (gpuMs[i] < 0.0f)
+                ImGui::TextDisabled("n/a");
+            else
+            {
+                ImGui::Text("%.3f ms", gpuMs[i]);
+                gpuTotal += gpuMs[i];
+            }
+        }
+        ImGui::EndTable();
+        ImGui::Text("Measured grass total: %.3f ms", gpuTotal);
+        ImGui::SetItemTooltip("Placement rows are exact (standalone compute passes). The draw "
+                              "rows need TIMESTAMP_QUERY_INSIDE_PASSES and read \"n/a\" without "
+                              "it, because grass draws share a render pass with the rest of the "
+                              "3D plan. Passes can overlap on the GPU, so this is not wall-clock.");
+    }
+
+    ImGui::TextDisabled("A/B a change: note instances + ms here, apply the change, compare. "
+                        "Keep the camera still -- placement is camera-relative.");
+}
+
 void DrawFoliageTab()
 {
     if (!GEngine)
@@ -1354,7 +2890,8 @@ void DrawFoliageTab()
     changed |= ImGui::SliderFloat("GI (ambient x light)", &f.giStrength, 0.0f, 1.0f, "%.2f");
     ImGui::TextDisabled("  scale ambient by terrain light level so shadowed foliage stops glowing (0 = off)");
     changed |= ImGui::SliderFloat("Fill fade end (m)", &f.fillFadeEnd, 0.0f, 1000.0f, "%.0f");
-    ImGui::TextDisabled("  distance where fill + ambient boost fade out (distant foliage -> plain sky-ambient; 0 = never)");
+    ImGui::TextDisabled(
+        "  distance where fill + ambient boost fade out (distant foliage -> plain sky-ambient; 0 = never)");
 
     ImGui::Separator();
     ImGui::TextDisabled("Spherical canopy normals (GPU-driven path; leaf sections only)");
@@ -1539,6 +3076,274 @@ void DrawShadowsTab()
         ImGui::SetClipboardText(summary);
 }
 
+// Screen-space ambient occlusion (GTAO) — its own tab rather than a section buried under
+// Shadows, because the two things you actually do here are A/B the effect on and off and flip
+// between the lit result and the raw buffer, and both need to be one click away.
+void DrawAmbientOcclusionTab()
+{
+    if (!GEngine)
+    {
+        return;
+    }
+    Engine::AoSettings ao = GEngine->GetAoSettings();
+    bool changed = false;
+
+    ImGui::TextDisabled("Short-range AO from the depth+normal prepass: local folds, corners,");
+    ImGui::TextDisabled("and the contact between objects and the ground. Ambient term only.");
+    ImGui::Separator();
+
+    changed |= ImGui::Checkbox("Enabled", &ao.enabled);
+    ImGui::TextDisabled("  the A/B: toggle this and watch corners and object bases");
+    changed |= ImGui::Checkbox("Directional ambient (bent normal)", &ao.bentNormal);
+    ImGui::TextDisabled("  Stage 2: light the ambient from the direction that is actually OPEN,");
+    ImGui::TextDisabled("  not from the surface normal. Changes where light comes from, not just");
+    ImGui::TextDisabled("  how much — this is the one that gives shaded surfaces form.");
+    changed |= ImGui::Combo("Raw buffer view", &ao.debugMode, "Off (lit scene) AO (greyscale) Bent normal (RGB) ");
+    ImGui::TextDisabled("  Off        = the normal lit scene in colour, AO folded into ambient");
+    ImGui::TextDisabled("  AO         = the visibility buffer; white = open, dark = occluded");
+    ImGui::TextDisabled("  Bent normal= the direction light arrives from, as colour. Use this to");
+    ImGui::TextDisabled("               see what 'Directional ambient' is actually doing.");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Coverage");
+    changed |= ImGui::SliderFloat("Radius (m)", &ao.radius, 0.1f, 10.0f, "%.2f");
+    ImGui::TextDisabled("  world-space reach. ~1 m = tight contact shadow, 2-4 m = room corners");
+    changed |= ImGui::SliderFloat("Max radius (px)", &ao.maxRadiusPixels, 8.0f, 512.0f, "%.0f");
+    ImGui::TextDisabled("  cost clamp. WATCH THIS: whenever it bites it SHORTENS the radius above,");
+    ImGui::TextDisabled("  so a low value looks exactly like 'AO does nothing' up close");
+    changed |= ImGui::SliderFloat("Strength", &ao.strength, 0.1f, 4.0f, "%.2f");
+    ImGui::TextDisabled("  exponent on visibility; 1 = physical, higher = deeper");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Sample budget (no TAA here, so this is the whole per-frame budget)");
+    changed |= ImGui::SliderInt("Slices", &ao.slices, 1, 8);
+    ImGui::TextDisabled("  azimuthal directions per pixel");
+    changed |= ImGui::SliderInt("Steps", &ao.steps, 2, 32);
+    ImGui::TextDisabled("  horizon march steps per slice. Raise this BEFORE widening the blur;");
+    ImGui::TextDisabled("  a wide radius with few steps steps over small occluders");
+    changed |= ImGui::SliderInt("Mip march (0 = off)", &ao.maxMip, 0, 6);
+    ImGui::TextDisabled("  0 = every tap full-res (stable). Higher = more reach close to a");
+    ImGui::TextDisabled("  surface, but FLICKERS while moving — no TAA here to absorb it.");
+    changed |= ImGui::SliderFloat("Thickness", &ao.thickness, 0.05f, 8.0f, "%.2f");
+    ImGui::TextDisabled("  falloff past the radius; too low and thin poles shadow the sky behind them");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Bilateral denoise (this replaces temporal filtering entirely)");
+    changed |= ImGui::SliderFloat("Blur radius", &ao.blurRadius, 0.0f, 16.0f, "%.1f");
+    ImGui::TextDisabled("  too wide washes out the contact darkening that is the point");
+    changed |= ImGui::SliderFloat("Depth reject", &ao.blurDepthScale, 1.0f, 128.0f, "%.0f");
+    ImGui::TextDisabled("  higher = stops harder at silhouettes");
+    changed |= ImGui::SliderFloat("Normal reject", &ao.blurNormalPower, 1.0f, 32.0f, "%.0f");
+    ImGui::TextDisabled("  higher = stops harder at creases (keeps wall/floor contact)");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("GPU cost (last completed frame)");
+    {
+        float gpuMs[32];
+        const int regions = GEngine->GetWaterGpuTimings(gpuMs, 32);
+        if (regions <= (int)Engine::kGtaoGpuRegionBegin)
+        {
+            ImGui::TextDisabled("Unavailable (adapter lacks TIMESTAMP_QUERY / non-wgpu backend).");
+        }
+        else if (ImGui::BeginTable("aoGpuTimings", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+        {
+            float total = 0.0f;
+            const int end = std::min(regions, (int)Engine::kGtaoGpuRegionEnd);
+            for (int i = (int)Engine::kGtaoGpuRegionBegin; i < end; ++i)
+            {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(GEngine->GetWaterGpuTimingName(i));
+                ImGui::TableNextColumn();
+                if (gpuMs[i] < 0.0f)
+                    ImGui::TextDisabled("n/a");
+                else
+                {
+                    ImGui::Text("%.3f ms", gpuMs[i]);
+                    total += gpuMs[i];
+                }
+            }
+            const float frame = gpuMs[(int)Engine::kFrameGpuRegionTotal];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("GPU frame total");
+            ImGui::TableNextColumn();
+            if (frame < 0.0f)
+                ImGui::TextDisabled("n/a");
+            else
+                ImGui::Text("%.3f ms", frame);
+            ImGui::EndTable();
+            ImGui::Text("AO: %.3f ms", total);
+            if (frame > 0.0f)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%.1f%% of the GPU frame)", 100.0f * total / frame);
+            }
+            ImGui::SetItemTooltip("Split three ways because they answer different questions: prep "
+                                  "is fixed setup (partly shared with occlusion culling), the "
+                                  "horizon march scales with slices x steps, and the blur scales "
+                                  "with its radius. Toggle Enabled off and watch the frame total "
+                                  "for the honest delta — passes can overlap, so this sum is an "
+                                  "upper bound on what disabling AO gives back.");
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Reset AO to defaults"))
+    {
+        const bool keepEnabled = ao.enabled;
+        ao = Engine::AoSettings{};
+        ao.enabled = keepEnabled;
+        changed = true;
+    }
+
+    if (changed)
+    {
+        GEngine->SetAoSettings(ao);
+    }
+}
+
+// Interior sky visibility (LIT-020) — its own tab for the same reason AO has one: the two things
+// you actually do here are A/B the effect and flip to the raw reach buffer, and both have to be
+// one click away. Judging this through full lighting is much harder than looking at the buffer.
+void DrawInteriorSkyTab()
+{
+    if (!GEngine)
+    {
+        return;
+    }
+    Engine::InteriorSkySettings is = GEngine->GetInteriorSkySettings();
+    bool changed = false;
+
+    ImGui::TextDisabled("Tells the renderer it is INDOORS: a top-down depth map of the object");
+    ImGui::TextDisabled("scene. Geometry above a surface removes its SKY AMBIENT, toward a floor.");
+    ImGui::TextDisabled("Direct sun (shadow maps) and local lights are never touched.");
+    ImGui::Separator();
+
+    changed |= ImGui::Checkbox("Enabled (per-frame maps, Stage 1)", &is.enabled);
+    ImGui::TextDisabled("  the A/B: stand in a doorway and toggle. Hotkey: Ctrl+Shift+I");
+    changed |= ImGui::Checkbox("Baked volumes (Stage 2)", &is.baked);
+    ImGui::TextDisabled("  the other implementation: occlusion resolved per MODEL, so its edges");
+    ImGui::TextDisabled("  follow the building instead of a camera-space grid — which is what");
+    ImGui::TextDisabled("  caused the shadow patches. Hotkey: Ctrl+Shift+B.");
+    ImGui::TextDisabled("  Needs WGR_SKY_BAKE_VOLUMES=1 at STARTUP to produce the volumes; this");
+    ImGui::TextDisabled("  switch only decides whether shading reads them. Both can be on, but");
+    ImGui::TextDisabled("  compare them one at a time.");
+    changed |= ImGui::Checkbox("Reach buffer (greyscale)", &is.debug);
+    ImGui::TextDisabled("  white = open sky above, black = fully roofed. Applies to whichever of");
+    ImGui::TextDisabled("  the two is on. Tune against THIS,");
+    ImGui::TextDisabled("  not against the lit scene. Hotkey: Ctrl+Shift+O");
+    ImGui::TextDisabled("  (both work with this panel closed — Ctrl+` reopens it)");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Look (Strength and Floor apply to BOTH implementations)");
+    changed |= ImGui::SliderFloat("Strength", &is.strength, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("  0 = inert, 1 = full attenuation down to the floor");
+    changed |= ImGui::SliderFloat("Floor", &is.floorLevel, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("  minimum ambient in a sealed room. NOT optional — OFP interiors carry");
+    ImGui::TextDisabled("  almost no local lights, so 0 here is a black box you cannot play in.");
+    changed |= ImGui::SliderFloat("Kernel (m)", &is.kernel, 0.0f, 8.0f, "%.2f");
+    ImGui::TextDisabled("  softening radius: roughly how far light appears to reach in past an");
+    ImGui::TextDisabled("  opening. This is what grades a porch instead of drawing a hard line.");
+    changed |= ImGui::SliderFloat("Directional", &is.directional, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("  0 = the room just gets darker. 1 = the ambient arrives FROM the");
+    ImGui::TextDisabled("  opening, so the wall facing the window is brighter than the wall");
+    ImGui::TextDisabled("  beside it. This is the knob that reads as 'light through the window'.");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Map (cost + resolving power)");
+    changed |= ImGui::SliderInt("Resolution", &is.resolution, 256, 4096);
+    changed |= ImGui::SliderFloat("Extent (m, half-box)", &is.extent, 32.0f, 512.0f, "%.0f");
+    ImGui::TextDisabled("  %.2f m per texel. Roofs and walls need well under a metre; window",
+                        is.resolution > 0 ? (2.0f * is.extent / float(is.resolution)) : 0.0f);
+    ImGui::TextDisabled("  reveals are NOT reachable here at any setting (that is the Stage 2 bake).");
+    changed |= ImGui::SliderFloat("Height (m)", &is.height, 32.0f, 1024.0f, "%.0f");
+    ImGui::TextDisabled("  how far above/below the camera the box reaches; must clear the tallest");
+    ImGui::TextDisabled("  roof you can stand under");
+    // The tilted maps look along a ~50 deg slant, so a point `extent` away laterally sits
+    // extent*sin(50) along their view axis and falls out of the depth slab once that passes
+    // `height`. The zenith map is unaffected, so the symptom is subtle: window light quietly
+    // stops working at range while the roofs still darken correctly.
+    const float tiltReach = is.extent * 0.766f; // sin(50 deg)
+    if (tiltReach > is.height)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                           "  ! extent too large for height: the TILTED maps clip past %.0f m",
+                           is.height / 0.766f);
+        ImGui::TextDisabled("  raise Height above %.0f, or lower Extent, or the window-light", tiltReach);
+        ImGui::TextDisabled("  directions silently stop contributing at range.");
+    }
+    changed |= ImGui::SliderFloat("Bias (m)", &is.bias, 0.0f, 4.0f, "%.2f");
+    ImGui::TextDisabled("  too low: open ground occludes itself (the whole world dims). Too high:");
+    ImGui::TextDisabled("  light leaks in under thin roofs.");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("GPU cost (last completed frame)");
+    {
+        float gpuMs[32];
+        const int regions = GEngine->GetWaterGpuTimings(gpuMs, 32);
+        if (regions <= (int)Engine::kInteriorSkyGpuRegionBegin)
+        {
+            ImGui::TextDisabled("Unavailable (adapter lacks TIMESTAMP_QUERY / non-wgpu backend).");
+        }
+        else if (ImGui::BeginTable("isGpuTimings", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+        {
+            float total = 0.0f;
+            const int end = std::min(regions, (int)Engine::kInteriorSkyGpuRegionEnd);
+            for (int i = (int)Engine::kInteriorSkyGpuRegionBegin; i < end; ++i)
+            {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(GEngine->GetWaterGpuTimingName(i));
+                ImGui::TableNextColumn();
+                if (gpuMs[i] < 0.0f)
+                    ImGui::TextDisabled("n/a");
+                else
+                {
+                    ImGui::Text("%.3f ms", gpuMs[i]);
+                    total += gpuMs[i];
+                }
+            }
+            // The frame total is the number that decides whether this is affordable, so show it
+            // next to the feature's own cost rather than making the reader hunt another tab.
+            const float frame = gpuMs[(int)Engine::kFrameGpuRegionTotal];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("GPU frame total");
+            ImGui::TableNextColumn();
+            if (frame < 0.0f)
+                ImGui::TextDisabled("n/a");
+            else
+                ImGui::Text("%.3f ms", frame);
+            ImGui::EndTable();
+            ImGui::Text("Interior sky: %.3f ms", total);
+            if (frame > 0.0f)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%.1f%% of the GPU frame)", 100.0f * total / frame);
+            }
+            ImGui::SetItemTooltip("Sum of the rows above, from the last completed frame. Toggle "
+                                  "Enabled off and watch the frame total to get the honest "
+                                  "delta: passes can overlap on the GPU, so this sum is an "
+                                  "upper bound on what disabling the feature gives back.");
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Reset interior sky to defaults"))
+    {
+        const bool keepEnabled = is.enabled;
+        is = Engine::InteriorSkySettings{};
+        is.enabled = keepEnabled;
+        changed = true;
+    }
+
+    if (changed)
+    {
+        GEngine->SetInteriorSkySettings(is);
+    }
+}
+
 // Live anti-aliasing knobs — MSAA sample count, SSAA render scale and
 // alpha-to-coverage apply at the next frame boundary, so the effect is
 // visible immediately while hunting for the shipped default.
@@ -1592,6 +3397,17 @@ void DrawPerfTab()
         ImGui::EndTable();
     }
     ImGui::Text("draw calls %.0f avg", perf.AvgDrawCalls());
+    if (GEngine)
+    {
+        const int swapInterval = GEngine->GetSwapInterval();
+        ImGui::Text("Presentation: %s", swapInterval == 0  ? "VSync off"
+                                        : swapInterval < 0 ? "Adaptive VSync"
+                                                           : "VSync on");
+        float gpuMs[32];
+        const int gpuRegions = GEngine->GetWaterGpuTimings(gpuMs, 32);
+        if (gpuRegions > Engine::kFrameGpuRegionTotal && gpuMs[Engine::kFrameGpuRegionTotal] >= 0.0f)
+            ImGui::Text("GPU submitted frame %.2f ms (excludes present wait)", gpuMs[Engine::kFrameGpuRegionTotal]);
+    }
     ImGui::SameLine();
     if (ImGui::Button("Reset window"))
         perf.Reset();
@@ -1724,12 +3540,12 @@ void DrawTonemapTab()
     ImGui::SetItemTooltip("Off by default so it doesn't fight manual per-ToD exposure tuning.\n"
                           "When on, exposure is scaled toward key / scene-average luminance.");
     ImGui::BeginDisabled(!ex.enabled);
-    exChanged |= ImGui::SliderFloat("Key (target grey)##exposure", &ex.key, 0.02f, 1.0f, "%.3f",
-                                    ImGuiSliderFlags_Logarithmic);
+    exChanged |=
+        ImGui::SliderFloat("Key (target grey)##exposure", &ex.key, 0.02f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
     exChanged |= ImGui::SliderFloat("Min scale##exposure", &ex.minScale, 0.05f, 1.0f, "%.3f");
     exChanged |= ImGui::SliderFloat("Max scale##exposure", &ex.maxScale, 1.0f, 16.0f, "%.3f");
-    exChanged |= ImGui::SliderFloat("Adapt rate##exposure", &ex.rate, 0.005f, 0.5f, "%.3f",
-                                    ImGuiSliderFlags_Logarithmic);
+    exChanged |=
+        ImGui::SliderFloat("Adapt rate##exposure", &ex.rate, 0.005f, 0.5f, "%.3f", ImGuiSliderFlags_Logarithmic);
     ImGui::SetItemTooltip("Per-frame ease toward the target (framerate-dependent for now).");
     exChanged |= ImGui::SliderFloat("Sky weight##exposure", &ex.skyWeight, 0.0f, 1.0f, "%.2f");
     ImGui::SetItemTooltip("Metering weight of the top of the frame (sky) vs the bottom (ground).\n"
@@ -1748,8 +3564,8 @@ void DrawTonemapTab()
     snprintf(preset, sizeof(preset),
              "tonemap: exposure=%.3f temp=%.3f tint=%.3f contrast=%.3f sat=%.3f lift=%.3f gain=%.3f "
              "hable=%s encode=%s",
-             t.exposure, t.temperature, t.tint, t.contrast, t.saturation, t.lift, t.gain,
-             t.hable ? "true" : "false", t.encode ? "true" : "false");
+             t.exposure, t.temperature, t.tint, t.contrast, t.saturation, t.lift, t.gain, t.hable ? "true" : "false",
+             t.encode ? "true" : "false");
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputText("##tonemapPreset", preset, sizeof(preset), ImGuiInputTextFlags_ReadOnly);
     if (ImGui::Button("Copy preset to clipboard"))
@@ -1783,11 +3599,12 @@ void DrawSkyTab()
     ImGui::TextDisabled("ToD %.2f h", Glob.clock.GetTimeOfDay() * 24.0f);
 
     changed |= ImGui::Checkbox("Auto (time-of-day presets)", &s.autoToD);
-    ImGui::SetItemTooltip("On = drive the atmosphere look (exposure, sun intensity, rayleigh, mie, ozone, "
-                          "turbidity, sun radius, night intensity) from the per-ToD preset table each frame, "
-                          "interpolated like the tonemap grade — the sliders below show the live values but "
-                          "edits are overwritten next frame. Off = hold your manual values so you can tune "
-                          "(then copy the preset). The toggles (sky lighting, aerial shadow, fog falloff) stay live either way.");
+    ImGui::SetItemTooltip(
+        "On = drive the atmosphere look (exposure, sun intensity, rayleigh, mie, ozone, "
+        "turbidity, sun radius, night intensity) from the per-ToD preset table each frame, "
+        "interpolated like the tonemap grade — the sliders below show the live values but "
+        "edits are overwritten next frame. Off = hold your manual values so you can tune "
+        "(then copy the preset). The toggles (sky lighting, aerial shadow, fog falloff) stay live either way.");
 
     ImGui::BeginDisabled(!s.enabled);
 
@@ -1853,13 +3670,82 @@ void DrawSkyTab()
     changed |= ImGui::SliderInt("Light samples", &s.lightSamples, 2, 32);
 
     ImGui::Separator();
+    ImGui::TextUnformatted("Clouds");
+    ImGui::TextDisabled("raymarched cloud shell in the sky (also reflected in water + SH ambient)");
+    changed |= ImGui::Checkbox("Coverage follows weather", &s.cloudCoverageFromWeather);
+    ImGui::SetItemTooltip("On: cloud cover is driven by the world's overcast, so Zeus, the "
+                          "`weather` console command and mission weather all move the sky. "
+                          "Off: the Coverage slider below authors it directly.");
+    ImGui::BeginDisabled(s.cloudCoverageFromWeather);
+    changed |= ImGui::SliderFloat("Coverage", &s.cloudCoverage, 0.0f, 1.0f, "%.2f");
+    ImGui::EndDisabled();
+    if (s.cloudCoverageFromWeather)
+    {
+        changed |= ImGui::SliderFloat("  clear cover", &s.cloudCoverageClear, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("  overcast cover", &s.cloudCoverageFull, 0.0f, 1.0f, "%.2f");
+        ImGui::TextDisabled("  cover at overcast 0 and 1; the Zeus slider lerps between them");
+    }
+    changed |= ImGui::SliderFloat("Evolve (m/s)", &s.cloudEvolve, 0.0f, 60.0f, "%.1f");
+    ImGui::TextDisabled("  how fast clouds FORM and DISSOLVE (0 = frozen shapes that only drift");
+    ImGui::TextDisabled("  with the wind). Slow on purpose: ~8 turns the field over in ~20 min.");
+    ImGui::SetItemTooltip("0 = clear sky; low = isolated cumulus; high = solid overcast deck. Also dims the "
+                          "directional sun / lifts ambient as it rises (overcast reads flat).");
+    changed |= ImGui::SliderFloat("Density", &s.cloudDensity, 0.005f, 0.3f, "%.3f", ImGuiSliderFlags_Logarithmic);
+    ImGui::SetItemTooltip("Cloud extinction (1/m): higher = more opaque / darker undersides");
+    changed |= ImGui::SliderFloat("Base altitude (m)", &s.cloudBottom, 200.0f, 6000.0f, "%.0f");
+    changed |= ImGui::SliderFloat("Top altitude (m)", &s.cloudTop, 400.0f, 10000.0f, "%.0f");
+    changed |= ImGui::SliderFloat2("Wind (m/s)", s.cloudWind, -30.0f, 30.0f, "%.1f");
+    changed |= ImGui::SliderFloat("Shape size (m)", &s.cloudShapeSize, 2000.0f, 20000.0f, "%.0f");
+    ImGui::SetItemTooltip("World size of the base cloud blobs — LARGER = less visible tiling across the map");
+    changed |= ImGui::SliderFloat("Detail size (m)", &s.cloudDetailSize, 400.0f, 5000.0f, "%.0f");
+    ImGui::SetItemTooltip("Edge detail tile — keep INCOMMENSURATE with shape (not a simple multiple) so the "
+                          "combined pattern's visual period is long");
+    changed |= ImGui::SliderFloat("Warp amount (m)", &s.cloudWarpAmount, 0.0f, 3000.0f, "%.0f");
+    ImGui::SetItemTooltip("Domain-warp displacement — the single highest-impact anti-repetition knob (breaks "
+                          "the grid regularity that makes tiling legible)");
+    changed |= ImGui::SliderFloat("Warp size (m)", &s.cloudWarpSize, 2000.0f, 20000.0f, "%.0f");
+    changed |= ImGui::SliderFloat("Weather amount", &s.cloudWeatherAmount, 0.0f, 1.0f, "%.2f");
+    ImGui::SetItemTooltip("How much coverage DRIFTS across the sky (0 = uniform everywhere, which reads same-y)");
+    changed |= ImGui::SliderFloat("Weather size (m)", &s.cloudWeatherSize, 5000.0f, 40000.0f, "%.0f");
+    ImGui::SetItemTooltip("World scale of the coverage drift — big, so cloudy/clear regions span the map");
+    changed |= ImGui::SliderFloat("Forward scatter g", &s.cloudHgG, 0.0f, 0.9f, "%.2f");
+    ImGui::SetItemTooltip("Henyey-Greenstein anisotropy: higher = brighter silver lining toward the sun");
+    changed |= ImGui::SliderFloat("Powder", &s.cloudPowder, 0.0f, 1.0f, "%.2f");
+    ImGui::SetItemTooltip("Beer-Powder dark-edge term (the fluffy look)");
+    changed |= ImGui::SliderFloat("Ambient fill", &s.cloudAmbient, 0.0f, 2.0f, "%.2f");
+    ImGui::SetItemTooltip("Sky-ambient scale on the shadowed cloud sides");
+    changed |= ImGui::SliderFloat("Max distance (m)", &s.cloudMaxDist, 5000.0f, 80000.0f, "%.0f");
+    ImGui::SetItemTooltip("March / visibility cap; the far deck dissolves into the horizon haze");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Ground shadows (CLD-020)");
+    changed |= ImGui::SliderFloat("Cloud shadow strength", &s.cloudShadowStrength, 0.0f, 1.0f, "%.2f");
+    ImGui::TextDisabled("How much the deck dims direct sun on terrain, objects, grass and water. 0 = off, and "
+                        "the pass then writes fully-lit texels rather than being skipped, so switching it off "
+                        "clears the shadows instead of freezing the last ones on the ground.");
+    ImGui::TextDisabled("Ambient is untouched, so shaded ground settles toward sky ambient rather than black. "
+                        "Two limits worth knowing: the map is evaluated at sea level, so a hillside and the "
+                        "valley below it get the same shadow (fine for something this soft), and it covers a "
+                        "4 km square around the camera -- outside that, surfaces read fully lit rather than "
+                        "dark, because missing data must never invent shadow.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Stars");
+    changed |= ImGui::SliderFloat("Star brightness", &s.starIntensity, 0.0f, 4.0f, "%.2f");
+    ImGui::TextDisabled("Procedural star field, gated to night by sun altitude -- it cannot affect a daytime sky. "
+                        "Added before the cloud composite, so a deck covers the stars the way it covers the sky "
+                        "behind them. It wheels with the sun's bearing, which is the celestial clock, so stars "
+                        "drift through the night. No twinkle: that needs a per-frame clock the sky UBO does not "
+                        "carry, and faking it from the sun's bearing would change over hours, not seconds.");
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Night floor");
     ImGui::TextDisabled("authored deep-blue that fills in as the sun sets (the physical model goes near-black)");
     // Colours are normalised (click the swatch for the picker); intensity scales them.
     changed |= ImGui::ColorEdit3("Zenith colour", s.nightZenith);
     changed |= ImGui::ColorEdit3("Horizon colour", s.nightHorizon);
-    changed |= ImGui::SliderFloat("Night intensity", &s.nightIntensity, 0.0f, 0.2f, "%.4f",
-                                  ImGuiSliderFlags_Logarithmic);
+    changed |=
+        ImGui::SliderFloat("Night intensity", &s.nightIntensity, 0.0f, 0.2f, "%.4f", ImGuiSliderFlags_Logarithmic);
     changed |= ImGui::SliderFloat("Day at sun elev (deg)", &s.nightStartDeg, -10.0f, 20.0f, "%.1f");
     ImGui::SetItemTooltip("Sun elevation at/above which it's full day (night floor off)");
     changed |= ImGui::SliderFloat("Night at sun elev (deg)", &s.nightEndDeg, -20.0f, 5.0f, "%.1f");
@@ -1886,10 +3772,9 @@ void DrawSkyTab()
              "ozone=%.2f turbidity=%.2f ground=%.3f,%.3f,%.3f haze=%.2f "
              "night=%.3f,%.3f,%.3f/%.3f,%.3f,%.3f int=%.4f band=%.1f,%.1f",
              s.exposure, s.sunIntensity, s.sunAngularRadius, s.rayleigh[0] * 1e6f, s.rayleigh[1] * 1e6f,
-             s.rayleigh[2] * 1e6f, s.mie * 1e6f, s.mieG, s.ozone, s.turbidity, s.ground[0], s.ground[1],
-             s.ground[2], s.horizonHaze, s.nightZenith[0], s.nightZenith[1], s.nightZenith[2],
-             s.nightHorizon[0], s.nightHorizon[1], s.nightHorizon[2], s.nightIntensity, s.nightStartDeg,
-             s.nightEndDeg);
+             s.rayleigh[2] * 1e6f, s.mie * 1e6f, s.mieG, s.ozone, s.turbidity, s.ground[0], s.ground[1], s.ground[2],
+             s.horizonHaze, s.nightZenith[0], s.nightZenith[1], s.nightZenith[2], s.nightHorizon[0], s.nightHorizon[1],
+             s.nightHorizon[2], s.nightIntensity, s.nightStartDeg, s.nightEndDeg);
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputText("##skyPreset", preset, sizeof(preset), ImGuiInputTextFlags_ReadOnly);
     if (ImGui::Button("Copy preset to clipboard"))
@@ -1948,6 +3833,151 @@ void DrawCullingTab()
     }
 }
 
+// WTR-003 water debug view names — file scope so both the Water tab combo and the
+// Ctrl+Shift+W cycle hotkey can reference them. Index maps 1:1 onto WgrWaterDebugView.
+static const char* const kWaterDebugViews[] = {
+    "Off (normal shading)",        // 0
+    "FFT displacement",            // 1
+    "FFT horizontal",              // 2
+    "FFT vertical",                // 3
+    "FFT slope",                   // 4
+    "Jacobian",                    // 5
+    "Compression",                 // 6
+    "Curvature",                   // 7
+    "Crest energy",                // 8
+    "Slope variance",              // 9
+    "Material coordinate",         // 10
+    "Displaced world coordinate",  // 11
+    "Interaction height",          // 12
+    "Interaction velocity",        // 13
+    "Interaction foam/aeration",   // 14
+    "Persistent foam source",      // 15
+    "Persistent foam history",     // 16
+    "Surface velocity",            // 17
+    "Water-column depth",          // 18
+    "Camera-to-surface distance",  // 19
+    "SSR colour",                  // 20
+    "SSR confidence",              // 21
+    "Planar colour",               // 22
+    "Planar geometry validity",    // 23
+    "Directional sky/cloud refl.", // 24
+    "Reflection-source selection", // 25
+    "Refraction ray",              // 26
+    "Refraction hit validity",     // 27
+    "Refraction path length",      // 28
+    "RGB transmittance",           // 29
+    "Underwater extinction",       // 30 (reserved)
+    "Underwater in-scattering",    // 31 (reserved)
+    "God-ray shadow visibility",   // 32 (reserved)
+    "Caustic intensity",           // 33 (reserved)
+    "Whitewater particle state",   // 34 (reserved)
+    "Whitewater pool occupancy",   // 35 (reserved)
+    "Particle overflow",           // 36 (reserved)
+    "Interaction velocity",        // 37 (WTR-012)
+    "Interaction height",          // 38 (WTR-012)
+    "WTR-040: Directional sky",    // 39
+    "WTR-040: Directional clouds", // 40
+    "WTR-040: Planar sky",         // 41
+    "WTR-040: Planar clouds",      // 42
+    "WTR-040: Planar geom only",   // 43
+    "WTR-040: Planar validity",    // 44
+    "WTR-040: SSR only",           // 45
+    "WTR-040: Reflection owner",   // 46 (R=SSR, B=planar, G=directional)
+};
+static constexpr int kWaterDebugViewCount = static_cast<int>(std::size(kWaterDebugViews));
+static_assert(kWaterDebugViewCount == 47, "Water debug view names must match WgrWaterDebugView (0..46)");
+
+// WTR-004 standard test scene definitions
+static const char* const kWaterTestScenes[] = {
+    "None (Custom / Authored Defaults)",                      // 0
+    "WTR-Test-01 — Seabed checkerboard (Refraction)",         // 1
+    "WTR-Test-02 — Cloud pitch (Reflection pitch stability)", // 2
+    "WTR-Test-03 — Ocean altitude (Cascade filtering)",       // 3
+    "WTR-Test-04 — Projectile grid (Interaction solver)",     // 4
+    "WTR-Test-05 — Boat wake (Vessel wake propagation)",      // 5
+    "WTR-Test-06 — Explosion (Impulse & aeration)",           // 6
+    "WTR-Test-07 — Underwater light (God rays & volumetric)", // 7
+    "WTR-Test-08 — Waterline (Near-field submersion)",        // 8
+    "WTR-Test-09 — Shoreline (Swash, foam & wet band)",       // 9
+    "WTR-Test-10 — Weather transition (Calm/storm spectrum)"  // 10
+};
+static constexpr int kWaterTestSceneCount = static_cast<int>(std::size(kWaterTestScenes));
+
+static void ApplyWtrTestScenePreset(Poseidon::Engine::WaterSettings& s, int index)
+{
+    s.testScene = index;
+    switch (index)
+    {
+        case 1: // WTR-Test-01 — Seabed checkerboard
+            s.enabled = true;
+            s.alpha = 0.35f;
+            s.colorExt = 0.05f;
+            s.coastFade = 0.05f;
+            s.foamWidth = 0.0f;
+            s.foamIntensity = 0.0f;
+            s.freeze.freezeTime = true;
+            s.freeze.fixedTime = 12.0f;
+            s.debugView = 18; // Water-column depth
+            break;
+        case 2: // WTR-Test-02 — Cloud pitch
+            s.enabled = true;
+            s.waveAmp = 0.0f; // Calm water
+            s.freeze.freezeTime = true;
+            s.freeze.fixedTime = 42.0f;
+            s.freeze.freezeClouds = true;
+            s.debugView = 24; // Directional sky/cloud reflection
+            break;
+        case 3: // WTR-Test-03 — Ocean altitude
+            s.enabled = true;
+            s.fadeStart = 1000.0f;
+            s.fadeEnd = 10000.0f;
+            s.freeze.freezeTime = true;
+            s.freeze.fixedTime = 100.0f;
+            s.debugView = 0;
+            break;
+        case 4: // WTR-Test-04 — Projectile grid
+            s.enabled = true;
+            s.freeze.freezeInteraction = false;
+            s.freeze.fixedDelta = 1.0f / 60.0f;
+            s.debugView = 12; // Interaction height
+            break;
+        case 5: // WTR-Test-05 — Boat wake
+            s.enabled = true;
+            s.debugView = 17; // Surface velocity
+            break;
+        case 6: // WTR-Test-06 — Explosion
+            s.enabled = true;
+            s.debugView = 14; // Interaction foam/aeration
+            break;
+        case 7: // WTR-Test-07 — Underwater light
+            s.enabled = true;
+            s.debugView = 31; // Underwater in-scattering
+            break;
+        case 8: // WTR-Test-08 — Waterline
+            s.enabled = true;
+            s.debugView = 29; // RGB transmittance
+            break;
+        case 9: // WTR-Test-09 — Shoreline
+            s.enabled = true;
+            s.swashAmp = 0.50f;
+            s.swashSpeed = 0.05f;
+            s.coastFade = 1.50f;
+            s.foamWidth = 4.00f;
+            s.foamIntensity = 1.00f;
+            s.wetHeight = 0.50f;
+            s.wetDarken = 0.40f;
+            s.debugView = 0;
+            break;
+        case 10: // WTR-Test-10 — Weather transition
+            s.enabled = true;
+            s.freeze.freezeWeather = false;
+            s.debugView = 0;
+            break;
+        default:
+            break;
+    }
+}
+
 void DrawWaterTab()
 {
     if (!GEngine)
@@ -1962,22 +3992,57 @@ void DrawWaterTab()
     }
 
     auto s = GEngine->GetWaterSettings();
+    SetRifleWaterImpactSprayEnabled(s.rifleImpactSpray);
     bool changed = false;
 
     changed |= ImGui::Checkbox("Enabled", &s.enabled);
     ImGui::SetItemTooltip("Off = draw no water surface (the seabed shows through), for A/B");
 
+    // Keep this immediately below the master Water switch: it controls the old CPU
+    // impact presentation and must be easy to find during gameplay testing.
+    changed |= ImGui::Checkbox("Water splash particles", &s.rifleImpactSpray);
+    ImGui::SetItemTooltip("On by default at restrained activity. Enables/disables GPU whitewater "
+                          "and water-impact particle billboards. Ripples and foam remain active.");
+    SetRifleWaterImpactSprayEnabled(s.rifleImpactSpray);
+    ImGui::BeginDisabled(!s.rifleImpactSpray);
+    changed |= ImGui::SliderFloat("Splash particle activity", &s.waterSplashParticleActivity, 0.0f, 1.0f, "%.2f");
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Strength of the GPU water-spray emitter when enabled. 0.25 is the restrained default; 1.00 "
+                          "restores the original full effect.");
+
     ImGui::BeginDisabled(!s.enabled);
 
     ImGui::Separator();
     ImGui::TextUnformatted("Waves (cosmetic — buoyancy stays on the flat plane)");
+
+    const char* cascadePresets[] = {"Production Non-Harmonic (37m, 89m, 211m, 503m - >50km repeat)",
+                                    "GodotOceanWaves Reference Style (88m, 57m, 16m - 3 cascades)",
+                                    "Legacy Harmonic (48m, 144m, 432m, 1296m - 1296m repeat)"};
+    if (ImGui::Combo("Cascade Preset", &s.cascadePreset, cascadePresets, IM_ARRAYSIZE(cascadePresets)))
+    {
+        changed = true;
+    }
+    ImGui::SetItemTooltip("WTR-036C / WTR-037: Toggle between production non-harmonic coprime cascades, "
+                          "GodotOceanWaves reference parity preset, and legacy harmonic cascades.");
+    const char* fftResolutionPresets[] = {"256 (Performance)", "512 (Optimized default)", "1024 (Godot reference)"};
+    int fftResolutionIndex = s.fftResolution == 256 ? 0 : (s.fftResolution == 1024 ? 2 : 1);
+    if (ImGui::Combo("FFT resolution", &fftResolutionIndex, fftResolutionPresets, IM_ARRAYSIZE(fftResolutionPresets)))
+    {
+        static constexpr int resolutions[] = {256, 512, 1024};
+        s.fftResolution = resolutions[fftResolutionIndex];
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Live spectral-map resolution. 1024 matches GodotOceanWaves; 512 retains "
+                          "the important long-wave modes at roughly one quarter of its FFT cost. "
+                          "Changing this rebuilds only the water FFT resources.");
+
     changed |= ImGui::SliderFloat("Amplitude", &s.waveAmp, 0.0f, 4.0f, "%.2f");
     ImGui::SetItemTooltip("Overall wave height scale. Kept gentle so boats never float in air.");
     changed |= ImGui::SliderFloat("Choppiness", &s.waveChoppy, 0.0f, 1.5f, "%.2f");
     ImGui::SetItemTooltip("Horizontal steepness of the crests (Gerstner Q).");
     changed |= ImGui::SliderFloat("Speed", &s.waveSpeed, 0.0f, 3.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Scale (wavelength)", &s.waveScale, 0.25f, 8.0f, "%.2f",
-                                  ImGuiSliderFlags_Logarithmic);
+    changed |=
+        ImGui::SliderFloat("Scale (wavelength)", &s.waveScale, 0.25f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
     ImGui::SetItemTooltip("Multiplies every wavelength: >1 makes larger, farther-apart waves — the main "
                           "knob for how the field reads from a distance.");
 
@@ -1985,8 +4050,7 @@ void DrawWaterTab()
     ImGui::TextUnformatted("Distance detail (kills far-field moiré / repetition)");
     changed |= ImGui::SliderFloat("Fade start (m)", &s.fadeStart, 0.0f, 4000.0f, "%.0f");
     ImGui::SetItemTooltip("Distance at which wave detail begins to flatten.");
-    changed |= ImGui::SliderFloat("Fade end (m)", &s.fadeEnd, 0.0f, 20000.0f, "%.0f",
-                                  ImGuiSliderFlags_Logarithmic);
+    changed |= ImGui::SliderFloat("Fade end (m)", &s.fadeEnd, 0.0f, 20000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
     ImGui::SetItemTooltip("Distance by which the water is fully flat (a smooth horizon mirror). Lower this "
                           "if the airplane view still shimmers or looks tiled; raise it if distant water "
                           "looks too dead.");
@@ -1995,8 +4059,7 @@ void DrawWaterTab()
 
     ImGui::Separator();
     ImGui::TextUnformatted("Shading");
-    changed |= ImGui::SliderFloat("Specular power", &s.specPower, 8.0f, 2000.0f, "%.0f",
-                                  ImGuiSliderFlags_Logarithmic);
+    changed |= ImGui::SliderFloat("Specular power", &s.specPower, 8.0f, 2000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
     ImGui::SetItemTooltip("Sun-glint sharpness (higher = tighter highlight).");
     changed |= ImGui::SliderFloat("Specular intensity", &s.specIntensity, 0.0f, 60.0f, "%.2f");
     ImGui::SetItemTooltip("Sun-glint brightness. Un-clamped on HDR so it blooms.");
@@ -2007,14 +4070,115 @@ void DrawWaterTab()
                           "this additionally darkens the shadowed surface (0 = physical sun-only removal).");
 
     ImGui::Separator();
+    ImGui::TextUnformatted("Surface look (energy model)");
+    changed |= ImGui::Checkbox("Physical composite", &s.physicalLook);
+    ImGui::SetItemTooltip("ON: Fresnel runs uncapped, the sun lobe is evaluated at the variance-filtered "
+                          "roughness at full radiance, and subsurface scattering gets its own light path. "
+                          "OFF: the legacy composite (Fresnel capped at 0.43-0.72, specular scaled to 0.12x, "
+                          "SSS multiplied by the near-black deep colour). Toggle for a direct A/B.");
+    ImGui::BeginDisabled(!s.physicalLook);
+    changed |= ImGui::SliderFloat("Sun glitter gain", &s.glitterGain, 0.0f, 3.0f, "%.2f");
+    ImGui::SetItemTooltip("Sun-specular gain; 1 = the model's own energy. This is the sparkle path — raise it "
+                          "if the sun track looks dull, lower it if crests fire white specks.");
+    changed |= ImGui::SliderFloat("Subsurface gain", &s.sssGain, 0.0f, 3.0f, "%.2f");
+    ImGui::SetItemTooltip("Backlit-crest glow (the turquoise scatter through a wave with the sun behind it). "
+                          "1 = the reference's energy mapped onto our HDR sun radiance.");
+    changed |= ImGui::SliderFloat("Reflection gain", &s.reflectionGain, 0.0f, 1.5f, "%.2f");
+    changed |= ImGui::SliderFloat("Reflection FOV padding", &s.reflectionFovPad, 1.0f, 3.0f, "%.2fx");
+    changed |= ImGui::SliderFloat("Reflection edge fade", &s.reflectionEdgeFade, 0.02f, 0.49f, "%.2f");
+    ImGui::TextDisabled("Fraction of the reflection target over which the planar reflection hands back to the "
+                        "sky/environment sample. Some water cannot be covered by a planar reflection at all: "
+                        "tilt down and the water beneath you maps outside the mirrored camera's frustum at ANY "
+                        "field of view, so padding cannot reach it and this fade is what carries those pixels. "
+                        "At 0.03 the swap read as a line across the sea, because planar has parallax-correct "
+                        "clouds and the environment sample does not. Wider = the reflection loses parallax "
+                        "gradually instead of ending; too wide and you lose planar parallax over most of the "
+                        "water.");
+    ImGui::TextDisabled("How much wider the planar reflection renders than the screen's field of view. The "
+                        "reflected camera otherwise inherits the main projection exactly, so a grazing "
+                        "reflection needs directions that were never rendered -- the lookup runs off the edge "
+                        "of the reflection target and the reflected clouds end in a visible line across the "
+                        "water. 1.00 restores that. Padding trades angular resolution for coverage; the planar "
+                        "sample is mip-filtered by design, so a little softness costs less than a hard edge.");
+    ImGui::SetItemTooltip("Scales the physical Fresnel reflection weight. 1 = uncapped (correct); lower only "
+                          "if the sky/planar reflection itself is wrong and you need to hide it.");
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Sea state");
+    changed |= ImGui::Checkbox("Physical sea-state coupling", &s.seaStateCoupling);
+    ImGui::SetItemTooltip("ON: the amplitude slider sets a wind speed, so the JONSWAP peak moves with "
+                          "it and a rougher sea grows LONGER waves (height linear in the slider, "
+                          "wavelength ~amp^0.75). OFF: the legacy behaviour — the whole spectrum is "
+                          "scaled uniformly, so waves only get taller at the same wavelength, which "
+                          "reads as short steep chop.");
+    changed |= ImGui::SliderFloat("Shore breaker gain", &s.shoreWaveGain, 0.0f, 3.0f, "%.2f");
+    ImGui::SetItemTooltip("Strength of the shoaling swell that runs in toward the beach. The train "
+                          "grows (Green's law) and its crests sharpen as the water shallows.");
+    changed |= ImGui::Checkbox("Underwater effect", &s.underwaterEffect);
+    ImGui::SetItemTooltip("OFF by default — the look is not good enough to ship on yet. ON: metric "
+                          "underwater extinction and in-scattering using the Water tab's "
+                          "shallow/deep colours, classifying each view ray separately near the "
+                          "surface so a half-submerged view keeps its above-water part, plus "
+                          "world-anchored caustics on nearby seabed geometry. This also gates the "
+                          "water shader's own underwater distance fog, so OFF means a submerged "
+                          "view has no volume and no fog at all.");
+    {
+        // Shown even when the effect is off, greyed rather than hidden. Hiding them made the
+        // section look like it had no settings at all, which is not what "off" should mean.
+        ImGui::BeginDisabled(!s.underwaterEffect);
+        ImGui::Indent();
+        ImGui::TextDisabled("Thresholds");
+        changed |= ImGui::SliderFloat("Enter depth (m)", &s.underwaterEnterDepth, 0.0f, 1.0f, "%.3f");
+        ImGui::SetItemTooltip("How far the eye must sink BELOW the local wave-displaced surface "
+                              "before the effect engages.");
+        changed |= ImGui::SliderFloat("Exit depth (m)", &s.underwaterExitDepth, 0.0f, 1.0f, "%.3f");
+        ImGui::SetItemTooltip("How far the eye must rise ABOVE the surface before it releases. Keep "
+                              "this larger than Enter depth — equal values make the effect flicker "
+                              "while the eye rides a moving crest.");
+        changed |= ImGui::SliderFloat("Engage band (m)", &s.underwaterEngageBand, 0.0f, 6.0f, "%.2f");
+        ImGui::SetItemTooltip("How far above sea level the compositor keeps running. It must run a "
+                              "little while dry so a half-submerged view can be classified ray by "
+                              "ray. Past the crest height it only costs the froxel and caustic "
+                              "dispatches for a frame that resolves to no water.");
+        ImGui::TextDisabled("Colour");
+        changed |= ImGui::SliderFloat("Density", &s.underwaterDensity, 0.0f, 4.0f, "%.2f");
+        ImGui::SetItemTooltip("Absorption density multiplier. Lower is clearer water and a longer "
+                              "view; higher closes the view down faster. 1.0 is the tuned default.");
+        changed |= ImGui::SliderFloat("Colour bias", &s.underwaterColorBias, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("1 = absorption hue taken from the Deep colour above, so submerging "
+                              "keeps the same substance you swam into. 0 = the fixed curve the "
+                              "effect used before, which was unrelated to the water's own colour "
+                              "and read as a more turquoise liquid. Drag between the two to "
+                              "compare.");
+        changed |= ImGui::SliderFloat("Caustic gain", &s.underwaterCausticGain, 0.0f, 4.0f, "%.2f");
+        ImGui::SetItemTooltip("Strength of the caustic pattern on nearby seabed geometry. Only "
+                              "visible where there is geometry to receive it.");
+        ImGui::TextDisabled("  Shallow/Deep colour and Extinction above also drive this.");
+        ImGui::Unindent();
+        ImGui::EndDisabled();
+    }
+    changed |= ImGui::Checkbox("Low water quality (performance)", &s.lowQuality);
+    ImGui::SetItemTooltip("Drops SSR, planar reflection, bicubic filtering and the two smallest wave "
+                          "cascades. The reflected camera and its sky, terrain, objects, clouds and mip "
+                          "passes are not rendered, saving their full GPU cost.");
+    const char* geometryPresets[] = {"Performance (4x CDLOD range)", "Balanced (6x CDLOD range)",
+                                     "Reference High (8x CDLOD range)", "Ultra (12x CDLOD range)"};
+    changed |= ImGui::Combo("Wave mesh quality", &s.geometryQuality, geometryPresets, IM_ARRAYSIZE(geometryPresets));
+    ImGui::SetItemTooltip("Live coast-aware equivalent of GodotOceanWaves' clipmap mesh-quality selector. "
+                          "Higher settings retain dense wave geometry farther from the camera. Balanced "
+                          "is the default; Performance roughly halves visible water triangles, while "
+                          "Ultra is intended for screenshots or fast GPUs. Shoreline pruning and the ocean "
+                          "horizon remain active at every setting.");
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Coast (depth-based colour + soft shoreline)");
     changed |= ImGui::ColorEdit3("Shallow colour", s.shallowColor);
     ImGui::SetItemTooltip("Body tint of shallow water (near the coast).");
     changed |= ImGui::ColorEdit3("Deep colour", s.deepColor);
     ImGui::SetItemTooltip("Body tint of deep water; the surface blends shallow -> deep with the water "
                           "column depth reconstructed from the opaque-depth prepass.");
-    changed |= ImGui::SliderFloat("Colour clarity", &s.colorExt, 0.02f, 3.0f, "%.3f",
-                                  ImGuiSliderFlags_Logarithmic);
+    changed |= ImGui::SliderFloat("Colour clarity", &s.colorExt, 0.02f, 3.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
     ImGui::SetItemTooltip("Extinction (1/m): higher = the tint reaches the deep colour in shallower water, "
                           "so the depth colouring reads stronger. Lower = subtler, more uniform colour.");
     changed |= ImGui::SliderFloat("Soft edge width (m)", &s.coastFade, 0.0f, 3.0f, "%.2f");
@@ -2024,17 +4188,120 @@ void DrawWaterTab()
     ImGui::SetItemTooltip("Column-depth band the churning foam spans (peaks ~1/4 in). 0 = no foam.");
     changed |= ImGui::SliderFloat("Foam intensity", &s.foamIntensity, 0.0f, 2.0f, "%.2f");
     ImGui::SetItemTooltip("Brightness / coverage of the shoreline foam.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Ripple diagnostics");
+    ImGui::Text("Player water depth: %.3f m", static_cast<double>(GetPlayerWaterDepth()));
+    ImGui::Text("Events submitted (total): %u   drained last frame: %u",
+                TotalWaterInteractionsSubmitted(), LastWaterInteractionsDrained());
+    ImGui::TextDisabled("Walk into water and watch these three. Depth stays 0 = ground collision is not "
+                        "reporting water under the player, and nothing downstream can help. Depth rises but "
+                        "the submitted total does not = the emit conditions in Man::Simulate are not met "
+                        "(it needs depth > 0.05 m, and the continuous ripple also needs horizontal speed > "
+                        "0.15 m/s). Both rise but the water is flat = the events reach the renderer and the "
+                        "solver or its display is the problem -- check debug view 12 (interaction height).");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Wave foam (whitecaps)");
+    ImGui::TextDisabled("Crests breaking on open water, separate from the shoreline band above. These are "
+                        "different phenomena -- water breaking on land versus a crest collapsing under its own "
+                        "steepness -- and 'Foam intensity' used to scale both, so calming the ocean also "
+                        "stripped the surf.");
+    changed |= ImGui::SliderFloat("Wave foam intensity", &s.waveFoamIntensity, 0.0f, 2.0f, "%.2f");
+    ImGui::SetItemTooltip("Whitecaps and persistent breaker foam. 0 = none; the shoreline band is unaffected.");
+    changed |= ImGui::SliderFloat("Deep-water falloff", &s.waveFoamDeepFalloff, 0.0f, 1.0f, "%.2f");
+    ImGui::SetItemTooltip("How strongly deep water suppresses whitecaps. 0 = waves break the same everywhere "
+                          "(the old behaviour, which is why the open ocean read as too foamy). 1 = open water "
+                          "stays nearly smooth and breaking concentrates in shoaling water near the coast, "
+                          "which is where a real sea breaks. Depth ramp is 6 m to 45 m.");
     changed |= ImGui::SliderFloat("Swash amplitude (m)", &s.swashAmp, 0.0f, 1.0f, "%.2f");
     ImGui::SetItemTooltip("How far the near-shore waterline oscillates in/out over the wet beach "
                           "(cosmetic — buoyancy stays on the flat plane).");
-    changed |= ImGui::SliderFloat("Swash speed (Hz)", &s.swashSpeed, 0.0f, 1.0f, "%.3f",
-                                  ImGuiSliderFlags_Logarithmic);
+    changed |= ImGui::SliderFloat("Swash speed (Hz)", &s.swashSpeed, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
     ImGui::SetItemTooltip("Swash cycles per second (slow = long, lazy wash).");
     changed |= ImGui::SliderFloat("Wet band height (m)", &s.wetHeight, 0.0f, 4.0f, "%.2f");
     ImGui::SetItemTooltip("Terrain side: metres above sea level the damp/darkened intertidal band "
                           "reaches, on near-flat ground only (cliffs stay dry).");
     changed |= ImGui::SliderFloat("Wet darkening", &s.wetDarken, 0.3f, 1.0f, "%.2f");
     ImGui::SetItemTooltip("Albedo multiplier for wet sand (lower = darker). 1 = off.");
+
+    // WTR-001 — deterministic water debug controls (dev / capture / A-B / shader-diff use only).
+    // All freezes are renderer-local substitutions: they replace the UBO time/dt/seed the water,
+    // interaction, foam, cloud, and underwater caustic shaders see, WITHOUT touching Glob.time
+    // (gameplay + net clock) or any non-water subsystem other than the cloud wind offset (which
+    // rides the same water sim clock by design). Leave "Freeze time" off to retain live animation.
+    ImGui::Separator();
+    ImGui::TextUnformatted("Debug (WTR-001 — deterministic capture / A-B)");
+    ImGui::SetItemTooltip("Holds the water-sim clock, FFT, interaction solver, foam, or clouds "
+                          "at a fixed value so the same frame reproduces across launches for "
+                          "before/after captures and shader-diff work. Dev-only.");
+    auto& fz = s.freeze;
+    bool freezeFft = fz.freezeFft;
+    if (ImGui::Checkbox("Freeze FFT##bool", &freezeFft))
+    {
+        fz.freezeFft = freezeFft;
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Skip Fft::dispatch: the wave-spectrum holds at its last computed state. "
+                          "Combine with Freeze time to capture one frame's spectrum exactly.");
+    bool freezeInteraction = fz.freezeInteraction;
+    if (ImGui::Checkbox("Freeze interaction solver##bool", &freezeInteraction))
+    {
+        fz.freezeInteraction = freezeInteraction;
+        changed = true;
+    }
+    ImGui::SetItemTooltip("dt = 0 + skip Interaction::dispatch: the local ripple field holds its "
+                          "last state (no decay, no propagation, no event injection).");
+    bool freezeFoam = fz.freezeFoam;
+    if (ImGui::Checkbox("Freeze foam##bool", &freezeFoam))
+    {
+        fz.freezeFoam = freezeFoam;
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Skip Foam::dispatch: persistent foam stops advection + ageing at the "
+                          "last state (use with Freeze time so the advecting surface velocity is 0).");
+    bool freezeClouds = fz.freezeClouds;
+    if (ImGui::Checkbox("Freeze clouds##bool", &freezeClouds))
+    {
+        fz.freezeClouds = freezeClouds;
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Hold the cloud wind world offset at fixed time, so the cloud shell does "
+                          "not drift between captures. Implicit when Freeze time is on.");
+    bool freezeWeather = fz.freezeWeather;
+    if (ImGui::Checkbox("Freeze weather##bool", &freezeWeather))
+    {
+        fz.freezeWeather = freezeWeather;
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Reserve bit for future weather threading (no per-frame weather "
+                          "recomputation today). Implicit when Freeze time is on, since the "
+                          "interaction weather vector recomputes off the frozen time.");
+    bool freezeTime = fz.freezeTime;
+    if (ImGui::Checkbox("Freeze water-sim clock##bool", &freezeTime))
+    {
+        fz.freezeTime = freezeTime;
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Hold the water-sim clock passed to the FFT, interaction, foam and "
+                          "underwater caustic shaders at fixed time. Clouds honour this too.");
+    changed |= ImGui::SliderFloat("Fixed time (s)", &fz.fixedTime, 0.0f, 3600.0f, "%.2f");
+    ImGui::SetItemTooltip("Seconds (replaces Glob.time when Freeze time or Freeze clouds is on). "
+                          "One value keeps the four sim clocks (water, interaction, cloud, "
+                          "underwater caustic) coherent for a single reproducible test frame.");
+    changed |= ImGui::SliderInt("FFT seed override", &fz.fftSeed, -1, 0x00ff'ffff);
+    ImGui::SetItemTooltip("Replaces fft_control[1] (authored default 1337). -1 = use 1337 (no "
+                          "swap). Any non-negative value rewrites the spectrum's random field on "
+                          "the next dispatch; two runs with the same seed reproduce h0 bit-for-bit.");
+    changed |= ImGui::SliderFloat("Fixed delta (s)", &fz.fixedDelta, 0.0f, 1.0f / 30.0f, "%.4f");
+    ImGui::SetItemTooltip("Fixes the interaction-solver step regardless of render FPS (0 = use the "
+                          "live frame delta clamped to 1/30). For WTR-063 fixed-timestep validation; "
+                          "leave 0 for capture mode (Freeze interaction is the standard freeze).");
+    changed |= ImGui::SliderInt("Camera path frame", &fz.cameraPathFrame, -1, 100000);
+    ImGui::SetItemTooltip("WTR-001 foundation only: when >= 0 the renderer tags each frame's water "
+                          "UBO digest with this integer so two runs compare frame-by-frame. The "
+                          "camera-path recorder itself is a separate WTR-004 work package; here we "
+                          "expose just the integer index for manual capture-then-replay audits.");
 
     if (ImGui::Button("Reset to defaults"))
     {
@@ -2043,6 +4310,108 @@ void DrawWaterTab()
     }
 
     ImGui::EndDisabled();
+
+    // WTR-003 — water debug views. Replaces the water surface shading with a single diagnostic
+    // (WgrWaterDebugView). Kept outside the disabled block so it works even with the water
+    // surface toggled off. Reserved slots (underwater/god-ray/caustic/whitewater) render black
+    // until their passes exist. The combo index maps 1:1 onto WgrWaterDebugView.
+    ImGui::Separator();
+    ImGui::TextUnformatted("Debug views (WTR-003)  [Ctrl+Shift+W cycles]");
+    // kWaterDebugViews / kWaterDebugViewCount are at file scope (shared with the hotkey).
+    int debugView = (s.debugView >= 0 && s.debugView < kWaterDebugViewCount) ? s.debugView : 0;
+    if (ImGui::Combo("Debug view", &debugView, kWaterDebugViews, (int)std::size(kWaterDebugViews)))
+    {
+        s.debugView = debugView;
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Replaces the water surface output with the selected diagnostic. FFT / "
+                          "interaction / foam views aggregate the four cascades; interaction & foam "
+                          "fields read zero outside the 256 m camera domain. Reserved entries have no "
+                          "backing pass yet and render black. wgpu backend only.");
+
+    // WTR-004 — Standard test harness (deterministic animation, frame-stepping, snapshot/restore)
+    ImGui::Separator();
+    ImGui::TextUnformatted("Standard test harness (WTR-004)");
+    auto& harness = Poseidon::WtrTestHarness::Instance();
+    int testScene = harness.IsActive() ? harness.GetCurrentPresetId()
+                                       : ((s.testScene >= 0 && s.testScene < kWaterTestSceneCount) ? s.testScene : 0);
+    if (ImGui::Combo("Test scene preset", &testScene, kWaterTestScenes, kWaterTestSceneCount))
+    {
+        s.testScene = testScene;
+        harness.SelectPreset(testScene, s, s.debugView);
+        changed = true;
+    }
+    ImGui::SetItemTooltip("Selects a standard WTR-Test-01..10 test scene preset.");
+
+    if (testScene > 0)
+    {
+        const auto* info = harness.GetPresetInfo(testScene);
+        if (info)
+        {
+            if (info->availability == Poseidon::WtrTestAvailability::Available)
+            {
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "Status: Available");
+            }
+            else if (info->availability == Poseidon::WtrTestAvailability::Partial)
+            {
+                ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.2f, 1.0f), "Status: %s", info->statusReason);
+            }
+            else
+            {
+                ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.2f, 1.0f), "Status: %s", info->statusReason);
+            }
+        }
+
+        ImGui::Spacing();
+        if (!harness.IsActive())
+        {
+            if (ImGui::Button("Start Test Harness"))
+            {
+                harness.Start(s, s.debugView);
+                changed = true;
+            }
+        }
+        else
+        {
+            if (ImGui::Button(harness.IsPaused() ? "Resume" : "Pause"))
+            {
+                harness.Pause();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Step Frame"))
+            {
+                harness.StepFrame(s);
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Restart"))
+            {
+                harness.Restart(s);
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Stop & Restore Settings"))
+            {
+                int restoredDebugView = s.debugView;
+                harness.Stop(s, restoredDebugView);
+                s.debugView = restoredDebugView;
+                changed = true;
+            }
+
+            ImGui::Text("Active Frame: %llu | Time: %.3f s | Triggers: %u",
+                        static_cast<unsigned long long>(harness.GetFrameIndex()),
+                        static_cast<double>(harness.GetFrameIndex() * harness.GetFixedDeltaTime()),
+                        harness.GetTriggeredEventCount());
+
+            if (ImGui::Button("Copy Metadata Log JSON"))
+            {
+                Vector3 dummyPos(100.0f, 5.0f, 100.0f);
+                Vector3 dummyRot(0.0f, 0.0f, 0.0f);
+                std::string logJson = harness.GenerateMetadataLog(s, dummyPos, dummyRot);
+                ImGui::SetClipboardText(logJson.c_str());
+            }
+        }
+    }
 
     if (changed)
         GEngine->SetWaterSettings(s);
@@ -2056,14 +4425,53 @@ void DrawWaterTab()
              "water: amp=%.2f choppy=%.2f speed=%.2f scale=%.2f fade=%.0f,%.0f warp=%.2f "
              "spec=%.0f,%.2f alpha=%.2f shadowDim=%.2f shallow=%.3f,%.3f,%.3f deep=%.3f,%.3f,%.3f "
              "clarity=%.3f coastFade=%.2f foam=%.2f,%.2f swash=%.2f,%.3f wet=%.2f,%.2f",
-             s.waveAmp, s.waveChoppy, s.waveSpeed, s.waveScale, s.fadeStart, s.fadeEnd, s.warpAmp,
-             s.specPower, s.specIntensity, s.alpha, s.shadowDim, s.shallowColor[0], s.shallowColor[1],
-             s.shallowColor[2], s.deepColor[0], s.deepColor[1], s.deepColor[2], s.colorExt, s.coastFade,
-             s.foamWidth, s.foamIntensity, s.swashAmp, s.swashSpeed, s.wetHeight, s.wetDarken);
+             s.waveAmp, s.waveChoppy, s.waveSpeed, s.waveScale, s.fadeStart, s.fadeEnd, s.warpAmp, s.specPower,
+             s.specIntensity, s.alpha, s.shadowDim, s.shallowColor[0], s.shallowColor[1], s.shallowColor[2],
+             s.deepColor[0], s.deepColor[1], s.deepColor[2], s.colorExt, s.coastFade, s.foamWidth, s.foamIntensity,
+             s.swashAmp, s.swashSpeed, s.wetHeight, s.wetDarken);
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputText("##waterPreset", preset, sizeof(preset), ImGuiInputTextFlags_ReadOnly);
     if (ImGui::Button("Copy preset to clipboard"))
         ImGui::SetClipboardText(preset);
+
+    // WTR-002 — per-region GPU pass timings (timestamp queries; the renderer harvests the
+    // readback asynchronously, so values lag the displayed frame by the ring depth, ~2-3
+    // frames). "n/a" rows are reserved spec slots (no standalone pass yet) or passes that
+    // haven't run since launch (e.g. frozen dispatches, spectrum init after the first frame).
+    ImGui::Separator();
+    ImGui::TextUnformatted("GPU timings (WTR-002)");
+    float gpuMs[32];
+    const int gpuRegions = GEngine->GetWaterGpuTimings(gpuMs, 32);
+    if (gpuRegions <= 0)
+    {
+        ImGui::TextDisabled("Unavailable (adapter lacks TIMESTAMP_QUERY / non-wgpu backend).");
+    }
+    else if (ImGui::BeginTable("wtrGpuTimings", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+    {
+        float gpuTotal = 0.0f;
+        // Grass shares the region array; its rows live in the Grass tab.
+        const int waterRegions = std::min(gpuRegions, (int)Engine::kWaterGpuRegionEnd);
+        for (int i = 0; i < waterRegions; ++i)
+        {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(GEngine->GetWaterGpuTimingName(i));
+            ImGui::TableNextColumn();
+            if (gpuMs[i] < 0.0f)
+                ImGui::TextDisabled("n/a");
+            else
+            {
+                ImGui::Text("%.3f ms", gpuMs[i]);
+                gpuTotal += gpuMs[i];
+            }
+        }
+        ImGui::EndTable();
+        ImGui::Text("Measured total: %.3f ms", gpuTotal);
+        ImGui::SetItemTooltip("Sum of the rows above (last completed frame). Not the water "
+                              "pipeline's wall-clock cost: passes may overlap on the GPU and "
+                              "reserved rows are folded into their host pass (SSR/refraction "
+                              "inside Water draw, caustics inside Underwater composite).");
+    }
 }
 void DrawMouseTab()
 {
@@ -2185,6 +4593,11 @@ void DrawMainWindow()
 
     if (ImGui::BeginTabBar("DevPanelTabs"))
     {
+        if (ImGui::BeginTabItem("Zeus"))
+        {
+            DrawZeusTab();
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Cheats"))
         {
             DrawCheatsTab();
@@ -2269,6 +4682,21 @@ void DrawMainWindow()
         if (ImGui::BeginTabItem("Foliage"))
         {
             DrawFoliageTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Amb. Occlusion"))
+        {
+            DrawAmbientOcclusionTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Interior Sky"))
+        {
+            DrawInteriorSkyTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Grass"))
+        {
+            DrawGrassTab();
             ImGui::EndTabItem();
         }
         ImGuiTabItemFlags shadowFlags = 0;
@@ -2474,6 +4902,122 @@ void ProcessEvent(const SDL_Event& event)
 {
     if (!s_initialized)
         return;
+    s_zeusConsumeMouseEvent = false;
+    s_zeusConsumeKeyboardEvent = false;
+    if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED && s_zeusCamera && !s_visible)
+    {
+        // SDL can restore the desktop cursor when a window regains focus even
+        // though the game remains in absolute mouse mode for Zeus editing.
+        SDL_HideCursor();
+    }
+    if (!s_visible && s_zeusCamera)
+    {
+        if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT)
+        {
+            s_zeusConsumeMouseEvent = true;
+            const SDL_Keymod modifiers = SDL_GetModState();
+            if ((modifiers & SDL_KMOD_SHIFT) != 0 && !s_zeusSelection.empty())
+            {
+                s_zeusRotateDrag = true;
+                s_zeusStatus = "Drag left/right to rotate the selected Zeus object(s).";
+            }
+            else if (s_zeusClickPlacement)
+            {
+                s_zeusSuppressNextMouseUp = true;
+                Defer([] { SpawnZeusAtClick(); });
+            }
+            else
+            {
+                // Absolute SDL event coordinates are not the space the visible
+                // in-game cursor lives in; resolve every Zeus position from the
+                // engine cursor instead.  See ZeusCursorPixel().
+                const ZeusPoint cursor = ZeusCursorPixel();
+                SelectZeusAtCursor(cursor.x, cursor.y);
+                if (s_zeusSelection.empty())
+                {
+                    // With click placement disabled, an empty left-drag is a
+                    // lasso by default. This keeps ordinary click-selection
+                    // and dragging an existing selection to move it intact.
+                    s_zeusLassoDrag = true;
+                    s_zeusLassoStartX = s_zeusLassoEndX = cursor.x;
+                    s_zeusLassoStartY = s_zeusLassoEndY = cursor.y;
+                    s_zeusStatus = "Drag to lasso Zeus-spawned objects.";
+                }
+                else
+                    BeginZeusMoveDrag();
+            }
+        }
+        else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT &&
+                 (s_zeusSuppressNextMouseUp || s_zeusRotateDrag || s_zeusMoveDrag || s_zeusLassoDrag))
+        {
+            s_zeusConsumeMouseEvent = true;
+            const ZeusPoint cursor = ZeusCursorPixel();
+            if (s_zeusLassoDrag)
+                SelectZeusInRect(s_zeusLassoStartX, s_zeusLassoStartY, cursor.x, cursor.y);
+            else if (s_zeusMoveDrag)
+                MoveZeusSelectionAtPixel(cursor.x, cursor.y);
+            s_zeusSuppressNextMouseUp = false;
+            s_zeusRotateDrag = false;
+            s_zeusMoveDrag = false;
+            s_zeusLassoDrag = false;
+            s_zeusMoveOffsets.clear();
+        }
+        // Zeus drags must NOT consume mouse motion.  Every Zeus position now
+        // comes from the engine cursor, and that cursor is advanced by
+        // SDLInput_BufferMouseMotion — which SDLEventWindow::HandleEvents skips
+        // for any event WantsMouse() claims.  Consuming motion here therefore
+        // freezes the cursor for the whole drag: the lasso stays a zero-area
+        // rectangle and selects nothing.  Motion reaching the free-fly camera is
+        // harmless, because that camera only looks while the right button is
+        // held (SetMouseLookRequiresRightButton).
+        else if (event.type == SDL_EVENT_MOUSE_MOTION && s_zeusRotateDrag)
+        {
+            if (event.motion.xrel != 0.0f)
+                RotateZeusSelectionBy(event.motion.xrel * 0.5f);
+        }
+        // Raise/lower the selection with the wheel.  Page Up / Page Down cannot
+        // serve here: they are the alternate bindings for the MoveUp/MoveDown
+        // user actions (see InputSubsystem's action table), so they already fly
+        // the free-fly camera vertically and a Zeus binding would fight it.
+        // The wheel is only claimed while something is selected, leaving it to
+        // the game otherwise.
+        else if (event.type == SDL_EVENT_MOUSE_WHEEL && !s_zeusSelection.empty() && event.wheel.y != 0.0f)
+        {
+            s_zeusConsumeMouseEvent = true;
+            const bool shiftDown = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+            const float step = shiftDown ? 5.0f : 0.5f;
+            const float deltaY = event.wheel.y * step;
+            Defer([deltaY] { MoveZeusSelectionVertical(deltaY); });
+        }
+        else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
+        {
+            const bool ctrlDown = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+            if (event.key.scancode == SDL_SCANCODE_DELETE)
+            {
+                s_zeusConsumeKeyboardEvent = true;
+                Defer([] { DeleteZeusSelection(); });
+            }
+            else if (ctrlDown && event.key.scancode == SDL_SCANCODE_C)
+            {
+                s_zeusConsumeKeyboardEvent = true;
+                s_zeusConsumeShortcutKeyUp = true;
+                s_zeusClipboard = s_zeusSelection;
+                s_zeusStatus = "Copied " + std::to_string(s_zeusClipboard.size()) + " Zeus object(s).";
+            }
+            else if (ctrlDown && event.key.scancode == SDL_SCANCODE_V)
+            {
+                s_zeusConsumeKeyboardEvent = true;
+                s_zeusConsumeShortcutKeyUp = true;
+                Defer([] { PasteZeusAtCursor(); });
+            }
+        }
+        else if (event.type == SDL_EVENT_KEY_UP && s_zeusConsumeShortcutKeyUp &&
+                 (event.key.scancode == SDL_SCANCODE_C || event.key.scancode == SDL_SCANCODE_V))
+        {
+            s_zeusConsumeKeyboardEvent = true;
+            s_zeusConsumeShortcutKeyUp = false;
+        }
+    }
     ImGui_ImplSDL3_ProcessEvent(&event);
 
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
@@ -2487,9 +5031,54 @@ void ProcessEvent(const SDL_Event& event)
         // of keyboard layout.  Ctrl is required so the unmodified key stays
         // available to the game (it's used in radio/chat commands).
         const bool ctrlDown = (event.key.mod & SDL_KMOD_CTRL) != 0;
-        if (event.key.scancode == SDL_SCANCODE_GRAVE && ctrlDown)
+        if (ctrlDown && (event.key.scancode == SDL_SCANCODE_GRAVE || event.key.scancode == SDL_SCANCODE_SEMICOLON ||
+                         event.key.scancode == SDL_SCANCODE_F8))
         {
             ToggleVisible();
+            return;
+        }
+        const bool shiftDown = (event.key.mod & SDL_KMOD_SHIFT) != 0;
+        // Ctrl+Shift+I / Ctrl+Shift+O — interior sky visibility: toggle the EFFECT, and toggle
+        // its greyscale reach view. Panel-free like the water debug view below, because the A/B
+        // that actually decides whether this feature looks right is "stand in a doorway and
+        // flip it", and doing that through a tab is hopeless while the screen is grey.
+        if (event.key.scancode == SDL_SCANCODE_I && ctrlDown && shiftDown && GEngine)
+        {
+            auto is = GEngine->GetInteriorSkySettings();
+            is.enabled = !is.enabled;
+            GEngine->SetInteriorSkySettings(is);
+            LOG_INFO(Core, "Interior sky visibility: {}", is.enabled ? "ON" : "off");
+            return;
+        }
+        if (event.key.scancode == SDL_SCANCODE_O && ctrlDown && shiftDown && GEngine)
+        {
+            auto is = GEngine->GetInteriorSkySettings();
+            is.debug = !is.debug;
+            // The reach view is a view OF the effect: with the effect off there is no map and
+            // the renderer forces debug back to 0, so the key would silently do nothing. Turn
+            // the effect on rather than leave the user pressing a dead key.
+            if (is.debug)
+                is.enabled = true;
+            GEngine->SetInteriorSkySettings(is);
+            LOG_INFO(Core, "Interior sky reach view: {}", is.debug ? "ON (greyscale)" : "off (lit scene)");
+            return;
+        }
+        if (event.key.scancode == SDL_SCANCODE_B && ctrlDown && shiftDown && GEngine)
+        {
+            auto is = GEngine->GetInteriorSkySettings();
+            is.baked = !is.baked;
+            GEngine->SetInteriorSkySettings(is);
+            LOG_INFO(Core, "Interior sky BAKED volumes: {}", is.baked ? "ON" : "off");
+            return;
+        }
+        // Ctrl+Shift+W — cycle the WTR-003 water debug view (works without
+        // opening the dev panel).  Wraps 0→1→…→36→0.
+        if (event.key.scancode == SDL_SCANCODE_W && ctrlDown && shiftDown && GEngine && GEngine->SupportsWater())
+        {
+            auto ws = GEngine->GetWaterSettings();
+            ws.debugView = (ws.debugView + 1) % kWaterDebugViewCount;
+            GEngine->SetWaterSettings(ws);
+            LOG_INFO(Core, "Water debug view: [{}] {}", ws.debugView, kWaterDebugViews[ws.debugView]);
             return;
         }
     }
@@ -2512,6 +5101,12 @@ void NewFrame()
     }
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
+    if (!s_visible)
+    {
+        DrawZeusInteractionOverlay();
+        if (s_zeusCursor)
+            s_zeusCursor->DrawCursor();
+    }
     if (s_visible)
         DrawMainWindow();
 }
@@ -2582,15 +5177,16 @@ void RequestDeferredReload(const char* modPath)
 
 bool WantsKeyboard()
 {
-    if (!s_initialized || !s_visible)
+    if (!s_initialized || (!s_visible && !s_zeusConsumeKeyboardEvent))
         return false;
-    return ImGui::GetIO().WantCaptureKeyboard;
+    return s_zeusConsumeKeyboardEvent || ImGui::GetIO().WantCaptureKeyboard;
 }
 
 bool WantsMouse()
 {
-    // Claim every mouse event while the panel is open to prevent the camera from moving
-    return s_initialized && s_visible;
+    // Claim every mouse event while the panel is open to prevent the camera from moving.
+    // Zeus claims only a placement click; motion still reaches the free-fly camera.
+    return s_initialized && (s_visible || s_zeusConsumeMouseEvent);
 }
 
 } // namespace DebugOverlay

@@ -7,7 +7,7 @@
 // Shares group(0) (the camera UBO + cascade shadow map) with the lit 3D
 // pipeline via the frame module, so terrain receives the same CSM shadows and
 // sun lighting.
-#import frame::{frame, reverse_z, fog_factor, apply_fog, sky_irradiance, sky_vis_ao, sky_vis_debug_on, sky_vis_debug_value}
+#import frame::{frame, reverse_z, fog_factor, apply_fog, sky_irradiance, sky_vis_ao, cloud_sun_shadow, sky_vis_debug_on, sky_vis_debug_value, gtao_ao, gtao_debug_on, gtao_bent_normal_world, gtao_debug_colour, interior_sky_ao, interior_sky_reach, interior_sky_debug_on, interior_sky_ambient_normal}
 #import shadow::shadow_strength
 #import lighting::lights_contrib
 #import color::srgb_to_linear
@@ -190,6 +190,11 @@ override linear: f32 = 0.0;
 
 @fragment
 fn fs_terrain(in: VsOut) -> @location(0) vec4<f32> {
+    // The reflected pass keeps only terrain on/above the global water plane. Fragment
+    // clipping is conservative for a displaced heightfield and avoids an oblique matrix.
+    if (dot(frame.clip_plane.xyz, in.world_pos + frame.cam_pos.xyz) + frame.clip_plane.w < 0.0) {
+        discard;
+    }
     // Receiver-plane derivatives must run in uniform control flow.
     let dwx = dpdx(in.world_pos);
     let dwy = dpdy(in.world_pos);
@@ -308,13 +313,31 @@ fn fs_terrain(in: VsOut) -> @location(0) vec4<f32> {
     // Sky-based lighting: replace the flat ambient with DIRECTIONAL sky irradiance (SH-9 env
     // projection, per surface normal), scaled by the skyAmbient knob in sun_ambient.w.
     if (sky_lit) {
-        sun_ambient = sky_irradiance(n) * frame.sun_ambient.w;
+        // Directional ambient (Stage 2): sky sampled along the bent normal — the average open
+        // direction — rather than the surface normal, so a slope beside an occluder picks up
+        // light from where it can actually see sky. Returns `n` when the path is off.
+        let amb_n = interior_sky_ambient_normal(
+            in.world_pos + frame.cam_pos.xyz,
+            gtao_bent_normal_world(in.clip.xy, n),
+        );
+        sun_ambient = sky_irradiance(amb_n) * frame.sun_ambient.w;
     }
-    // Sky-visibility AO: scale the ambient (directional SH or legacy flat) by the fraction of sky
-    // this column sees, so valleys/gorges/cliff-bases settle darker than open ground. Orthogonal to
-    // `shadow`, which removes the DIRECT sun. Off (returns 1) when sky_vis_strength = 0.
-    sun_ambient *= sky_vis_ao(in.world_xz);
-    let sun_raw = sun_diffuse * cos_fi * (1.0 - shadow) + sun_ambient;
+    // Ambient occlusion: scale the ambient (directional SH or legacy flat) by how much sky this
+    // point can see. Orthogonal to `shadow`, which removes the DIRECT sun. The two terms MULTIPLY
+    // because they occlude independently and at disjoint scales (plan §6): sky-visibility is the
+    // baked km-scale column factor that darkens valleys and cliff-bases, GTAO the screen-space
+    // near/mid term that resolves local folds and object contact. Each returns 1 when off.
+    //
+    // Interior sky visibility joins them as a third independent occluder. Terrain is deliberately
+    // absent from that MAP (a hillside is not a roof), but it must still RECEIVE the term: the
+    // floor of a shed, a barrack or an archway is terrain, and leaving it at full sky ambient
+    // while the walls around it darkened would look worse than not having the feature.
+    sun_ambient *= sky_vis_ao(in.world_xz)
+        * gtao_ao(in.clip.xy)
+        * interior_sky_ao(in.world_pos + frame.cam_pos.xyz, n);
+    // CLD-020: cloud transmittance dims the DIRECT term only, leaving sky ambient intact, so
+    // ground under a cloud settles toward ambient rather than toward black.
+    let sun_raw = sun_diffuse * cos_fi * (1.0 - shadow) * cloud_sun_shadow(in.world_xz) + sun_ambient;
     // HDR keeps radiance uncapped into the float target; LDR saturates like GL33.
     let sun = select(min(sun_raw, vec3<f32>(1.0)), sun_raw, linear > 0.5);
     let local = lights_contrib(in.world_pos, n, vec3<f32>(1.0), vec3<f32>(1.0), linear);
@@ -325,6 +348,18 @@ fn fs_terrain(in: VsOut) -> @location(0) vec4<f32> {
     // mask — responds to radius/azimuths/downsample/contrast.
     if (sky_vis_debug_on() > 0.5) {
         return vec4<f32>(vec3<f32>(sky_vis_debug_value(in.world_xz)), 1.0);
+    }
+
+    // Debug: the raw screen-space AO buffer as greyscale (unfogged), for tuning radius/strength/
+    // slices/steps/blur against the buffer itself rather than through the lit result.
+    if (gtao_debug_on() > 0.5) {
+        return vec4<f32>(gtao_debug_colour(in.clip.xy, n), 1.0);
+    }
+
+    // Debug: the interior sky-reach factor as greyscale (unfogged). Terrain and objects switch
+    // together so the whole opaque scene shows the same buffer.
+    if (interior_sky_debug_on() > 0.5) {
+        return vec4<f32>(vec3<f32>(interior_sky_reach(in.world_pos + frame.cam_pos.xyz)), 1.0);
     }
 
     // fog_enabled: 2 = aerial perspective via the froxel volume (per-fragment); 1 =

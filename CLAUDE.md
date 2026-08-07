@@ -1,5 +1,13 @@
 # CLAUDE.md
 
+> [!IMPORTANT]
+> **MANDATORY RULES FOR ALL AI AGENTS**: Before making code or shader modifications, you MUST inspect [.agents/README.md](.agents/README.md) and [.agents/AGENT_BOOTSTRAP_AND_DIAGNOSTICS.md](.agents/AGENT_BOOTSTRAP_AND_DIAGNOSTICS.md).
+> Key rules:
+> 1. **Use the scripts — do not hand-roll build/install/launch.** `scripts/Build.ps1`, `scripts/Install.ps1`, `scripts/Start.ps1` are the supported path (see [Build, install, run](#build-install-run) below). **`Install.ps1` must be run once per game install**: the retail game is missing files the remaster needs, and hand-copying only the two binaries leaves an install that boots but has a *dead Options menu* and missing UI art — a failure with no error message. Run it before assuming anything is a code bug.
+> 1b. **Dual Binary Deployment**: if you do deploy by hand, you MUST copy **BOTH** `PoseidonGame.exe` AND `wgpu_renderer.dll` to `D:\SteamLibrary\steamapps\common\ARMA Cold War Assault\`. Copying only one binary causes an instant `Entry Point Not Found` crash on launch.
+> 2. **WGSL Shader Rules**: Review [.agents/WGSL_CODING_RULES.md](.agents/WGSL_CODING_RULES.md). No 4-component swizzles on `vec2` (`.xxyy` / `.xyxy`), all variables must be explicitly declared in scope.
+> 3. **Startup Diagnostics**: If the game exits instantly, ALWAYS test with `cmd /c ".\ColdWarAssault.exe --render wgpu --window --dev --log-file cwr.log"` to read the panic traceback.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
@@ -8,7 +16,34 @@ The engine and game source for *Arma: Cold War Assault* (released 2001 as *Opera
 
 Important separations: the **source code** here is GPL; the **name/trademarks** ("ARMA", "Operation Flashpoint") are *not* granted (a fork must be renamed); the **game data** (models, textures, sounds, missions) is *not* in this repo — it ships separately under APL-SA, and the compiled binaries need it to run (free Demo data is on Steam).
 
-## Build
+## Build, install, run
+
+On Windows there is a supported three-step workflow. It was undocumented here until 2026-08-04,
+which is how an agent ends up hand-copying binaries into a game folder and then debugging the
+resulting half-installed game as if it were a renderer fault:
+
+```powershell
+.\scripts\Build.ps1                 # configure + build (default preset win-x64-clang-rwdi)
+.\scripts\Install.ps1               # ONCE per game install — see below
+.\scripts\Start.ps1                 # launch the built binary against the game data
+```
+
+**`Install.ps1` is not optional.** The retail *ARMA: Cold War Assault* install does not ship
+several things the remaster needs — `BIN\*.hpp` (the whole modern Options/main-menu resource
+set), `fonts`, `dtaExt` (equipment icons), `AddOns\cwr_logo.pbo`. It copies them from the Demo
+install, skipping anything already present (`-Force` to overwrite). On a fresh retail install
+that is ~64 files.
+
+Skipping it does **not** produce an error. `Load()` on a resource class the data does not define
+returns a display with zero controls, so the symptom is a menu entry that opens nothing at all,
+silently. The engine now falls back to the classic Options screen when `RscOptionsShell` is
+absent (`CreateOptionsDisplay`), so it degrades rather than dying — but you get the old UI, not
+the intended one.
+
+`Start.ps1 -Demo` runs against Demo data instead; `-Fullscreen`, `-LogFile <path>` and extra
+passthrough args are supported.
+
+## Build (raw CMake)
 
 Configure + build with a CMake preset (presets live in `cmake/presets/`, defined relative to `CMakePresets.json`):
 
@@ -64,7 +99,7 @@ A single Cargo workspace at the repo root (`Cargo.toml`) holds every crate, shar
 
 All members declare `rust-version = "1.87"` (wgpu 29's MSRV) so the workspace's MSRV-aware resolver doesn't hold shared dependencies back to older, incompatible versions.
 
-The **wgpu backend** (`engine/WgpuRenderer/`) is a `POSEIDON_ENABLE_WGPU`-gated graphics backend: the Rust `cdylib` is built by corrosion (fetched via CMake `FetchContent`) and driven from C++ (`EngineWgpu`) across a hand-written C ABI (`include/wgpu_renderer.h`). GL33 stays the default; select it at runtime with `--render wgpu`.
+The **wgpu backend** (`engine/WgpuRenderer/`) is a `POSEIDON_ENABLE_WGPU`-gated graphics backend: the Rust `cdylib` is built by corrosion (fetched via CMake `FetchContent`) and driven from C++ (`EngineWgpu`) across a hand-written C ABI (`include/wgpu_renderer.h`). WGPU is the default backend as of 2026-08-06; GL33 remains fully supported and is one flag away (`--render gl33`). In non-release builds the dev panel is also on by default (`--no-dev` disables it); release builds do not register the flag at all.
 
 ## Architecture
 

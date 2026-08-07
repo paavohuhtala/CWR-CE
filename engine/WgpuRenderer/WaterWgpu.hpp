@@ -55,13 +55,25 @@ class WaterWgpu : public IWaterRenderer
     // Static placement params (world_origin/terrain_grid/hm dims), captured on build;
     // sea_level is refreshed per frame.
     WgrWaterParams _params{};
+    WgrWaterInteractionParams _interaction{};
+    float _lastInteractionTime = 0.0f;
+    bool _haveInteractionDomain = false;
+    bool _interactionDemo = false;
+    int _lastInteractionDemoPulse = -1;
+    bool _cameraSubmerged = false;
+    // Throttling state for the submersion diagnostic in Simulate(); see the log site.
+    bool _loggedCameraSubmerged = false;
+    float _lastSubmersionLogTime = -1000.0f;
 
     // A node joins the water tree when its terrain min-height dips to or below this
     // world height (highest possible sea surface + a wave-crest margin).
     float _seaThreshold = 0.0f;
 
-    // LOD tuning, read from the environment once at construction.
+    // LOD tuning. The environment value remains an expert multiplier over the live
+    // Water-tab quality preset rather than silently overriding that control.
     float _baseMult;
+    float _baseMultScale;
+    int _activeGeometryQuality = -1;
     float _lodRatio;
     float _morphRegion;
     // How far the ocean extends past the map, as a multiple of the map size (the tree

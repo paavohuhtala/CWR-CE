@@ -6,9 +6,11 @@
 #include <Poseidon/Graphics/GraphicsEngineFactory.hpp> // GraphicsEngineParams
 #include <Poseidon/Graphics/Shadow/ShadowMath.hpp>
 #include <Poseidon/Graphics/Shared/SDLEventWindow.hpp>
+#include <Poseidon/Foundation/Types/LLinks.hpp>
 
 #include <wgpu_renderer.hpp>
 
+#include <array>
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -24,6 +26,7 @@ class TerrainWgpu;
 class WaterWgpu;
 class ITerrainRenderer;
 class Object;
+class Helicopter;
 class LODShapeWithShadow;
 
 enum class Sampler2DFlags : uint32_t
@@ -53,6 +56,9 @@ class EngineWgpu : public EngineDummy
     // False if the window / wgpu device failed to come up; the factory then drops
     // this engine and falls back.
     bool IsValid() const { return _renderer != nullptr; }
+    // The most recently controlled helicopter, held as a weak link so effects
+    // can survive the player leaving the cockpit without risking a stale pointer.
+    const Helicopter* LastGrassRotor() const;
 
     RString GetDebugName() const override;
     RString GetRendererName() const override;
@@ -65,6 +71,9 @@ class EngineWgpu : public EngineDummy
     int Width() const override;
     int Height() const override;
 
+    bool SetSwapInterval(int interval) override;
+    int GetSwapInterval() const override { return _swapInterval; }
+
     bool IsWindowed() const override;
     bool CanBeWindowed() const override;
 
@@ -74,6 +83,8 @@ class EngineWgpu : public EngineDummy
     void FinishDraw() override;
     void NextFrame() override;
     void Clear(bool clearZ, bool clearColor, PackedColor color) override;
+    void Screenshot(RString filename) override;
+    void FlushPendingScreenshot() override;
 
     void Draw2D(const Draw2DPars& pars, const Rect2DAbs& rect, const Rect2DAbs& clip) override;
     void DrawPoly(const MipInfo& mip, const Vertex2DAbs* vertices, int n, const Rect2DAbs& clip, int specFlags) override;
@@ -148,9 +159,32 @@ class EngineWgpu : public EngineDummy
     // pushes them into the water UBO each frame. Gated on the water renderer existing.
     bool SupportsWater() const override { return _renderer != nullptr && _water != nullptr; }
     WaterSettings GetWaterSettings() const override { return _waterLook; }
-    void SetWaterSettings(const WaterSettings& s) override { _waterLook = s; }
+    void SetWaterSettings(const WaterSettings& s) override;
+    // Legacy terrain grass layers call these while submitting their GrassTexture
+    // overlays.  The procedural system uses that exact hook as its eligibility
+    // signal instead of drawing over every opaque terrain cell.
+    void SetGrassParams(float a1, float a2, float a3 = 0, float a4 = 0) override;
+    void AddGrassImpact(Vector3Par position, float radius) override;
+      bool CanGrass() const override { return _renderer != nullptr; }
+      GrassSettings GetGrassSettings() const override { return _grass; }
+      void SetGrassSettings(const GrassSettings& settings) override;
+      int GetGrassSurfaceCount() const override;
+      const char* GetGrassLoadedMapName() const override;
+      const char* GetGrassSurfaceName(int index) const override;
+      bool IsGrassSurfaceEnabled(int index) const override;
+      void SetGrassSurfaceEnabled(int index, bool enabled) override;
     // Live look, read by WaterWgpu::DrawWater when building the per-frame water UBO.
     const WaterSettings& WaterLook() const { return _waterLook; }
+
+    // WTR-002 — GPU water-pipeline pass timings, read back from wgr_get_gpu_timings
+    // (non-blocking; the Rust side harvests asynchronously). Names follow the
+    // WgrGpuTimerRegion index contract.
+    int GetWaterGpuTimings(float* outMs, int maxCount) const override;
+    const char* GetWaterGpuTimingName(int region) const override;
+    uint32_t GetRuntimeCapabilityFlags() const override;
+
+    // GRS-A — grass instance counts, read back from wgr_get_grass_stats.
+    bool GetGrassStats(GrassStatsOut& out) const override;
 
     // GPU-driven cull DEBUG (ImGui Culling tab): only meaningful when GPU-driven is on.
     bool SupportsCullDebug() const override { return _renderer != nullptr && _gpuDriven; }
@@ -175,6 +209,22 @@ class EngineWgpu : public EngineDummy
     void SetFoliageSettings(const FoliageSettings& s) override
     {
         _foliage = s;
+        PushRenderParams();
+    }
+    // Screen-space AO knobs (docs/screen-space-ao-plan.md) — stored here, folded into the
+    // consolidated render-params block by PushRenderParams.
+    AoSettings GetAoSettings() const override { return _ao; }
+    void SetAoSettings(const AoSettings& s) override
+    {
+        _ao = s;
+        PushRenderParams();
+    }
+    // Interior sky visibility (docs/interior-sky-visibility-plan.md) — same pattern: stored
+    // here, folded into the consolidated render-params block by PushRenderParams.
+    InteriorSkySettings GetInteriorSkySettings() const override { return _interiorSky; }
+    void SetInteriorSkySettings(const InteriorSkySettings& s) override
+    {
+        _interiorSky = s;
         PushRenderParams();
     }
     void SetShadowMapSunFactor(float factor01) override { _smSunFactor = factor01; }
@@ -205,6 +255,9 @@ class EngineWgpu : public EngineDummy
     // Called by the water renderer: append a batch of `nodes` for the current camera
     // and enqueue its draw in submission order (after the opaque terrain + 3D).
     void SubmitWater(std::span<const WgrWaterNode> nodes);
+    // Called by TerrainWgpu after its terrain batch. The procedural grass system owns
+    // all blade placement; C++ only preserves ordering and the source camera.
+    void SubmitGrass();
 
   private:
     // A camera-relative view/projection plus the world-space camera position the
@@ -245,9 +298,14 @@ class EngineWgpu : public EngineDummy
     // current game time into _sky (preserving the live toggle knobs). Called once per
     // frame from NextFrame, before the render-params push.
     void UpdateAutoSky();
+    void SyncWaterLookProfile();
+    // Gentle, view-dependent eye accommodation for the visible sun. Kept separate
+    // from scene-average auto-exposure, which remains disabled to prevent white-outs.
+    void UpdateSunGlareExposure();
 
     SDL_Window* _window = nullptr;
     WgrRenderer* _renderer = nullptr;
+    RString _pendingScreenshotPath;
     // HDR path enabled (mirrors the renderer's WGR_HDR gate) — gates the tonemap tab.
     // Default on, matching the renderer; WGR_HDR=0 forces it off (see the ctor env read).
     bool _hdrEnabled = true;
@@ -255,8 +313,13 @@ class EngineWgpu : public EngineDummy
     bool _tonemapAuto = true;
     Engine::TonemapSettings _tonemap;
     Engine::ExposureSettings _exposure;
+    // Small multiplier applied only while the sun is centred in the player's view.
+    // The authored time-of-day tonemap exposure remains unchanged in dev controls.
+    float _sunGlareExposure = 1.0f;
     // Live GPU-water look, edited by the Water tab, read by WaterWgpu each frame.
     Engine::WaterSettings _waterLook;
+    std::string _waterLookMap;
+    bool _waterLookDirty = false;
     // Authored procedural-sky params (atmosphere + look); celestial fields are filled
     // per frame from LightSun in PushSkyRuntime.
     Engine::SkySettings _sky;
@@ -274,6 +337,7 @@ class EngineWgpu : public EngineDummy
     SDLEventWindow _eventWindow;
     int _w = 0;
     int _h = 0;
+    int _swapInterval = 1;
     bool _windowed = true;
 
     float _clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -387,6 +451,20 @@ class EngineWgpu : public EngineDummy
     ShadowMapTuning _smTuning;
     // Foliage lighting knobs (docs/foliage-translucency-plan.md), pushed via PushRenderParams.
     FoliageSettings _foliage;
+    AoSettings _ao;
+    // Interior sky visibility (docs/interior-sky-visibility-plan.md), pushed via PushRenderParams.
+    InteriorSkySettings _interiorSky;
+    GrassSettings _grass;
+    // A circular history of terrain contacts.  Kept in engine space so foot
+    // and vehicle trails persist even though grass placement is camera-relative.
+    std::array<WgrGrassTrack, WGR_GRASS_TRACK_COUNT> _grassTracks{};
+    size_t _nextGrassTrack = 0;
+    Vector3 _lastGrassTrackPos = VZero;
+    float _grassTrackSampleTime = 0.0f;
+    bool _haveGrassTrackPos = false;
+    // A weak link remains valid while a recently exited helicopter still
+    // exists, and becomes null automatically if the vehicle is deleted.
+    LLink<Helicopter> _lastGrassRotor;
     float _smSunFactor = 1.0f;
     bool _smEnabledFrame = false;
     shadow::CascadeSet _smCascades;
@@ -413,6 +491,9 @@ class EngineWgpu : public EngineDummy
     std::unique_ptr<WaterWgpu> _water;
     std::vector<WgrWaterNode> _waterNodes;
     std::vector<WgrWaterBatch> _waterBatches;
+
+    std::vector<WgrGrassBatch> _grassBatches;
+    bool _grassSubmitted = false;
 };
 
 Engine* CreateEngineWgpu(const GraphicsEngineParams& params);

@@ -4,6 +4,10 @@
 **Renderer:** `engine/WgpuRenderer` (wgpu-native, Rust) + C++ bridge (`EngineWgpu`)
 **Status:** FINALIZED (2026-07-06). Design decisions locked (§0); implementation staged (§8).
 
+> **RND-030 reconciliation (2026-08-02):** "implementation staged" above is out of date: the HDR pipeline is **implemented** -- `bloom.rs`, `bloom.wgsl`, `exposure.wgsl` and the HDR render targets are all present.
+>
+> The status line is left as written rather than rewritten, so the document's own history stays readable. See [RND-030-renderer-plan-reconciliation-20260802.md](../../../docs/roadmap/decisions/RND-030-renderer-plan-reconciliation-20260802.md).
+
 > First item on the renderer roadmap (**HDR** → per-pixel → CSM → Forward+). Per-pixel sun +
 > point lights landed ahead of it; HDR lands **before** Forward+, because clustered lighting exists
 > to pile many lights on a fragment and without an HDR target they clip at 1.0. Independent of the
@@ -335,7 +339,20 @@ are a first pass to re-tune by eye; auto-exposure (Stage 5) will subsume most ex
    buffer → GPU smoothing → sampled by the resolve, constrained per §4.2. No readback.
 
 ### 8.1 Dev toggles (current)
-- `WGR_HDR=1` — enable the HDR path (offscreen target + tonemap). Default off = LDR-direct A/B ref.
+
+> **Stage audit (2026-08-03).** Four of the five stages above are done: 1, 2 and 3 as written,
+> and 5 in **outcome but not in method** — the plan specifies a histogram compute pass, and
+> `exposure.wgsl` implements a downsample-chain luminance meter (`fs_lum_first` / `fs_lum_down`)
+> instead. The "no readback" constraint holds for the render path: the tonemap resolve
+> `textureLoad`s the 1×1 scale directly, and `read_scale` is a blocking dev-panel debug path.
+> **Stage 4 (NVG + night eye) is not started** — no `nvg` or `night_eye` symbol exists in the
+> renderer, so `Engine::EnableNightEye` has nothing to route to on this backend.
+>
+> The default in the line below is also stale — see the correction inline.
+
+- `WGR_HDR=1` — enable the HDR path (offscreen target + tonemap). ~~Default off = LDR-direct A/B
+  ref.~~ **Default is ON** (`hdr_enabled` falls back to `true`); `WGR_HDR=0` forces the LDR-direct
+  path, which is now the fallback rather than the reference.
 - `WGR_TONEMAP` — 1 = Hable (default when HDR on), 0 = passthrough clamp (plumbing check).
 - `WGR_HDR_ENCODE` — 1 = linear→sRGB encode (default when HDR on), 0 = write as-is.
 - `WGR_EXPOSURE` — linear exposure scale before the curve (default 1.0).

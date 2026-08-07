@@ -413,6 +413,17 @@ struct TestMeta {
     extra_args: Vec<String>,
     timeout: Option<u64>,
     assert_timeout: Option<u64>,
+    /// Seconds to wait for the game to announce `HARNESS_PORT`, when startup
+    /// costs much more than the rest of the test. Defaults to `timeout`.
+    ///
+    /// Exists because those two budgets are not the same thing. A WGPU-pinned
+    /// test builds 38 pipelines from 43 WGSL sources with no pipeline cache
+    /// before it can serve the harness; measured here that costs ~3s more than
+    /// GL33 on a discrete GPU, and it is shader-compile bound, so it scales
+    /// badly on a software rasteriser. Raising `timeout` to cover that would
+    /// also give the test a long tail on genuine failure, and with retries that
+    /// is minutes of a CI budget spent waiting on something already broken.
+    connect_timeout: Option<u64>,
     /// Binary-name override. When unset, the runner uses the default game binary.
     binary: Option<String>,
     /// Renderer-backend override (`--render <value>`) for tests that verify one
@@ -505,7 +516,30 @@ fn load_test_meta(test_path: &Path) -> TestMeta {
             || format!("{name}.toml"),
             |pos| format!("{}.toml", &name[..pos]),
         );
-        test_path.with_file_name(toml_name)
+        let own = test_path.with_file_name(toml_name);
+
+        // A `.seq/` phase inherits the sequence's sidecar when it has no toml of
+        // its own. Phases are run one file at a time, so without this the whole
+        // `foo.seq.toml` — mission, binary, renderer pin, timeouts — is silently
+        // dropped and every phase boots a default game. That failure is quiet
+        // and looks like a broken test rather than lost configuration: the phase
+        // reaches the main menu instead of the mission and fails on whatever it
+        // asserted first.
+        if own.exists() {
+            own
+        } else {
+            match test_path.parent() {
+                Some(dir)
+                    if dir
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().ends_with(".seq")) =>
+                {
+                    let dir_name = dir.file_name().unwrap_or_default().to_string_lossy();
+                    dir.with_file_name(format!("{dir_name}.toml"))
+                }
+                _ => own,
+            }
+        }
     };
 
     if !toml_path.exists() {
@@ -1215,7 +1249,13 @@ async fn run_sqf_test(
         || crate::config::get().clone(),
         crate::config::TridentConfig::new,
     );
-    let config = effective_cfg.client_config();
+    let mut config = effective_cfg.client_config();
+    // Startup gets its own budget when the test asks for one; everything else
+    // (command and event waits) stays on `timeout`, so a slow-to-boot backend
+    // does not also buy a long tail on a genuine mid-test failure.
+    if let Some(secs) = meta.connect_timeout {
+        config.connect_timeout = std::time::Duration::from_secs(secs);
+    }
     let timeout = effective_cfg.timeout;
     let assert_timeout = meta
         .assert_timeout

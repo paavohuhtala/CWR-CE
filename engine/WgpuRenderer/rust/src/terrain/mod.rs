@@ -77,6 +77,12 @@ pub struct TerrainShadowMap {
     pub sky_vis_contrast: f32,
     // Pad the struct to 48 bytes (a multiple of 16) for the uniform layout.
     pub _pad2: f32,
+    // CLD-020 cloud sun-transmittance mapping, riding this same shared group(0) uniform for the
+    // same reason the sky-visibility controls do: terrain, objects and grass all need it and none
+    // of them wants another binding. xy = the map's snapped world-xz min corner, z = 1/span in
+    // metres, w = strength. w = 0 means every surface reads fully lit, which is also what an
+    // off-map lookup returns -- missing data must never invent shadow.
+    pub cloud_shadow: glam::Vec4,
 }
 
 // Terrain height-sampling params for the mesh conform pass (vegetation): the world->
@@ -86,9 +92,9 @@ pub struct TerrainShadowMap {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TerrainConformParams {
-    pub origin: glam::Vec2,  // world xz of heightmap texel (0,0)
-    pub terrain_grid: f32,   // world metres per heightmap texel
-    pub enabled: f32,        // 1 when a heightmap is loaded, else 0
+    pub origin: glam::Vec2, // world xz of heightmap texel (0,0)
+    pub terrain_grid: f32,  // world metres per heightmap texel
+    pub enabled: f32,       // 1 when a heightmap is loaded, else 0
     pub hm_width: u32,
     pub hm_height: u32,
     pub _pad: [u32; 2],
@@ -117,6 +123,7 @@ pub struct Terrain {
     group2_layout: wgpu::BindGroupLayout,
 
     params_ubo: wgpu::Buffer,
+    params: WgrTerrainParams,
     #[allow(dead_code)] // kept alive: group1_bind references its view
     heightmap: wgpu::Texture,
     group1_bind: wgpu::BindGroup,
@@ -711,8 +718,13 @@ impl Terrain {
                 cache: None,
             })
         };
-        let pipeline =
-            make_pipeline("wgr_terrain_pipeline", "fs_terrain", &fs_constants, surface_format, true);
+        let pipeline = make_pipeline(
+            "wgr_terrain_pipeline",
+            "fs_terrain",
+            &fs_constants,
+            surface_format,
+            true,
+        );
         let pipeline_no_write = make_pipeline(
             "wgr_terrain_pipeline_no_write",
             "fs_terrain",
@@ -732,6 +744,7 @@ impl Terrain {
             group1_layout,
             group2_layout,
             params_ubo,
+            params: default_params,
             heightmap,
             heightmap_view,
             group1_bind,
@@ -743,7 +756,11 @@ impl Terrain {
             skyvis_view,
             sky_vis_strength,
             sky_vis_floor,
-            sky_vis_debug: if std::env::var("WGR_SKY_VIS_DEBUG").is_ok() { 1.0 } else { 0.0 },
+            sky_vis_debug: if std::env::var("WGR_SKY_VIS_DEBUG").is_ok() {
+                1.0
+            } else {
+                0.0
+            },
             sky_vis_contrast: env_f32("WGR_SKY_VIS_CONTRAST", 6.5),
             skyvis_opts: skyvis::SkyvisOptions {
                 k_azimuths: 12,
@@ -795,8 +812,9 @@ impl Terrain {
     // Cheap per-frame params refresh (no heightmap re-upload): the coast wet-band fields
     // (sea_level, time, swash, wet_*) animate every frame, and the static fields are re-sent
     // unchanged. Overwrites the whole params UBO.
-    pub fn set_params(&self, queue: &wgpu::Queue, params: WgrTerrainParams) {
+    pub fn set_params(&mut self, queue: &wgpu::Queue, params: WgrTerrainParams) {
         queue.write_buffer(&self.params_ubo, 0, bytemuck::bytes_of(&params));
+        self.params = params;
     }
 
     pub fn set_heightmap(
@@ -806,6 +824,7 @@ impl Terrain {
         heights: &[f32],
         params: WgrTerrainParams,
     ) {
+        self.params = params;
         let (w, h) = (params.hm_width, params.hm_height);
         if w == 0 || h == 0 || w > self.max_dim || h > self.max_dim {
             return;
@@ -958,9 +977,10 @@ impl Terrain {
         if scale != self.shadow_scale {
             self.shadow_scale = scale;
             if self.have_heightmap {
-                let (mw, mh) =
-                    shadow_mask_dims(self.hm_width, self.hm_height, scale, self.max_dim);
-                let hview = self.heightmap.create_view(&wgpu::TextureViewDescriptor::default());
+                let (mw, mh) = shadow_mask_dims(self.hm_width, self.hm_height, scale, self.max_dim);
+                let hview = self
+                    .heightmap
+                    .create_view(&wgpu::TextureViewDescriptor::default());
                 let mask = create_shadow_mask(device, mw, mh);
                 let mview = mask.create_view(&wgpu::TextureViewDescriptor::default());
                 self.group1_bind = make_group1(
@@ -1016,6 +1036,9 @@ impl Terrain {
             sky_vis_debug: self.sky_vis_debug,
             sky_vis_contrast: self.sky_vis_contrast,
             _pad2: 0.0,
+            // Filled by the caller from the Sky pass, which owns the map and its snapping. The
+            // terrain has no way to know where the cloud map was placed this frame.
+            cloud_shadow: glam::Vec4::new(0.0, 0.0, 1.0, 0.0),
         }
     }
 
@@ -1034,8 +1057,13 @@ impl Terrain {
         let Some(src) = &self.skyvis_src else {
             return;
         };
-        let (sv_w, sv_h, sv) =
-            skyvis::compute(&src.heights, src.w, src.h, src.terrain_grid, self.skyvis_opts);
+        let (sv_w, sv_h, sv) = skyvis::compute(
+            &src.heights,
+            src.w,
+            src.h,
+            src.terrain_grid,
+            self.skyvis_opts,
+        );
         let sv_bytes: Vec<u8> = sv
             .iter()
             .map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
@@ -1100,6 +1128,14 @@ impl Terrain {
             hm_height: self.hm_height,
             _pad: [0, 0],
         }
+    }
+
+    pub fn params(&self) -> WgrTerrainParams {
+        self.params
+    }
+
+    pub fn has_heightmap(&self) -> bool {
+        self.have_heightmap
     }
 
     // Ground layers as views into the shared texture registry (missing handles

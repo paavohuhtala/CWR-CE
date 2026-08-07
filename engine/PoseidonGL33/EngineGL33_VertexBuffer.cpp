@@ -478,8 +478,43 @@ void EngineGL33::CaptureScreenshotIfPending()
     if (w <= 0 || h <= 0)
         return;
 
+    // SDL/Xvfb may expose the default framebuffer as multisampled. OpenGL
+    // forbids glReadPixels directly from a multisample framebuffer, which made
+    // otherwise valid Trident captures fail only in headless CI. Resolve to a
+    // short-lived single-sample texture first; this leaves presentation and the
+    // pixels seen by the player unchanged.
+    GLuint captureFbo = 0;
+    GLuint captureTexture = 0;
+    glGenFramebuffers(1, &captureFbo);
+    glGenTextures(1, &captureTexture);
+    glBindTexture(GL_TEXTURE_2D, captureTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, captureFbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, captureTexture, 0);
+    const bool captureTargetReady = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+
     std::vector<uint8_t> pixels(w * h * 4);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    if (captureTargetReady)
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glReadBuffer(GL_BACK);
+        glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, captureFbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    }
+    else
+    {
+        LOG_ERROR(Graphics, "GL33: screenshot resolve target is incomplete; capture skipped");
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &captureFbo);
+    glDeleteTextures(1, &captureTexture);
+    if (!captureTargetReady)
+        return;
 
     // GL_LOWER_LEFT: glReadPixels Y=0 = bottom, need to flip rows.
     // Convert RGBA → RGB with Y flip.
@@ -547,6 +582,17 @@ int EngineGL33::SampleBackBufferNonBlack()
     if (w <= 0 || h <= 0)
         return -1;
 
+    // Read the default framebuffer explicitly. ResolveSSAAToDefault() puts the
+    // image there but does not change the read binding, so without this the
+    // sample reads whatever framebuffer happened to be bound — and when that is
+    // a multisampled post-FX FBO every glReadPixels fails with
+    // "GL_INVALID_OPERATION: FBO anti-alias method is not valid for read
+    // pixels", leaving the caller with a count of zero and no clue why.
+    GLint prevRead = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glReadBuffer(GL_BACK);
+
     int nonBlack = 0;
     // Sample a grid of 16x16 = 256 pixels across the framebuffer
     for (int sy = 0; sy < 16; sy++)
@@ -561,6 +607,7 @@ int EngineGL33::SampleBackBufferNonBlack()
                 nonBlack++;
         }
     }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prevRead));
     if (SSAAActive())
         BindFrameRenderTarget();
     return nonBlack;
@@ -580,10 +627,17 @@ bool EngineGL33::SamplePixel(int x, int y, uint8_t* outRGB)
     if (w <= 0 || h <= 0 || x < 0 || y < 0 || x >= w || y >= h)
         return false;
 
+    // Read the default framebuffer explicitly — see SampleBackBufferNonBlack.
+    GLint prevRead = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glReadBuffer(GL_BACK);
+
     // glReadPixels uses bottom-left origin; tri verbs use top-left.
     int glY = h - 1 - y;
     uint8_t pixel[4];
     glReadPixels(x, glY, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(prevRead));
     if (SSAAActive())
         BindFrameRenderTarget();
     outRGB[0] = pixel[0];

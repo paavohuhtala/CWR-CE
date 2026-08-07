@@ -41,7 +41,9 @@ impl Default for SkyvisOptions {
 // Deterministic integer hash -> [0,1) (no RNG, so the bake stays reproducible/cacheable). Bit-mixed
 // so it stays well-distributed at large world coordinates (the sin(dot)*large one-liner collapses).
 fn hash2(x: u32, y: u32) -> f32 {
-    let mut n = x.wrapping_mul(1597334677).wrapping_add(y.wrapping_mul(3812015801));
+    let mut n = x
+        .wrapping_mul(1597334677)
+        .wrapping_add(y.wrapping_mul(3812015801));
     n = (n ^ (n >> 15)).wrapping_mul(2246822519);
     n ^= n >> 13;
     (n & 0x00ff_ffff) as f32 / (0x0100_0000 as f32)

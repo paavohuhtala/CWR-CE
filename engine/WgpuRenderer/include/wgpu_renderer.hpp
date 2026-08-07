@@ -9,6 +9,30 @@
 
 #include <cstdint>
 
+// Increment when an incompatible change is made to the public C ABI.  The
+// engine checks this before creating a renderer so a matched build fails with a
+// useful diagnostic instead of proceeding with incompatible assumptions.
+#define WGR_ABI_VERSION 4u
+
+// Required capabilities are negotiated as a bit set inside WgrAbiCheck. A
+// newer engine can reject an older renderer DLL even if the shared layouts
+// still happen to match.
+#define WGR_ABI_FEATURE_BUILD_ID 0x00000001u
+#define WGR_ABI_FEATURE_SAFE_DIAGNOSTICS 0x00000002u
+#define WGR_ABI_FEATURE_RUNTIME_CAPABILITIES 0x00000004u
+
+enum WgrRuntimeCapability : uint32_t
+{
+    WGR_RUNTIME_CAP_BC_TEXTURES = 1u << 0,
+    WGR_RUNTIME_CAP_PARTIALLY_BOUND = 1u << 1,
+    WGR_RUNTIME_CAP_INDIRECT_FIRST_INSTANCE = 1u << 2,
+    WGR_RUNTIME_CAP_MULTI_DRAW_COUNT = 1u << 3,
+    WGR_RUNTIME_CAP_GPU_TIMESTAMPS = 1u << 4,
+    WGR_RUNTIME_CAP_TIMESTAMPS_IN_PASSES = 1u << 5,
+    WGR_RUNTIME_CAP_HDR = 1u << 6,
+    WGR_RUNTIME_CAP_MSAA = 1u << 7,
+};
+
 #if defined(_WIN32) && !defined(WGR_STATIC)
   #define WGR_API __declspec(dllimport)
 #else
@@ -113,7 +137,8 @@ enum WgrCmdKind : uint32_t
     WGR_CMD_CLEAR_DEPTH = 2,   // arg unused; starts a new depth-cleared segment
     WGR_CMD_DRAW_TERRAIN = 3,  // arg = index into WgrFrame.terrain_batches
     WGR_CMD_RESOLVE = 4,       // arg unused; tonemap the HDR scene to the swapchain, then draw UI display-referred
-    WGR_CMD_DRAW_WATER = 5     // arg = index into WgrFrame.water_batches
+    WGR_CMD_DRAW_WATER = 5,    // arg = index into WgrFrame.water_batches
+    WGR_CMD_DRAW_GRASS = 6     // arg = index into WgrFrame.grass_batches
 };
 
 // --- Surface / logging -------------------------------------------------------
@@ -408,6 +433,15 @@ struct WgrSky
     WgrVec4 night_zenith;  /* xyz = night radiance at the zenith, w = camera altitude ASL (m; aerial/sky raymarch origin) */
     WgrVec4 night_horizon; /* xyz = night radiance at the horizon */
     WgrVec4 night_params;  /* x = full-day sun_dir.y, y = full-night sun_dir.y, z = intensity, w = far-fade range (m; aerial dissolves the terrain edge into sky by this dist, 0 = off) */
+    /* Volumetric clouds (plan Stage 5): a raymarched cloud shell composited inside sky_radiance. */
+    WgrVec4 cloud0; /* x = coverage [0,1], y = extinction (1/m), z = bottom (m ASL), w = top (m ASL) */
+    WgrVec4 cloud1; /* x/y = wind world offset (m, RUNTIME, CPU-wrapped), z = shape scale (1/m), w = detail scale (1/m) */
+    WgrVec4 cloud2; /* x = HG forward g, y = powder strength, z = ambient scale, w = max march distance (m) */
+    WgrVec4 cloud3; /* x = weather scale (1/m), y = weather amount, z = warp scale (1/m), w = warp amount (m) */
+    /* Cloud EVOLUTION offsets (m, RUNTIME, CPU-wrapped): x = shape, y = detail, z = weather drift.
+     * Applied on the noise volume's third axis, so the field morphs in place — clouds form and
+     * dissolve — instead of only translating with the wind. w = pad. */
+    WgrVec4 cloud4;
 };
 
 /* --- Consolidated imgui-tweakable render params (docs/render-params-consolidation-plan.md) ---
@@ -428,6 +462,11 @@ struct WgrSkyLook
     WgrVec4 night_zenith;  /* xyz = night radiance at the zenith; w = horizon-haze strength */
     WgrVec4 night_horizon; /* xyz = night radiance at the horizon; w = aerial-shadow strength */
     WgrVec4 night_params;  /* x = full-day sun_dir.y, y = full-night sun_dir.y, z = night intensity, w = pad */
+    /* Cloud look (mirrors WgrSky::cloud0/1/2/3; cloud1.xy = wind offset is runtime, unused here). */
+    WgrVec4 cloud0; /* x = coverage, y = extinction (1/m), z = bottom (m), w = top (m) */
+    WgrVec4 cloud1; /* x/y unused (runtime wind offset), z = shape scale (1/m), w = detail scale (1/m) */
+    WgrVec4 cloud2; /* x = HG forward g, y = powder, z = ambient scale, w = max distance (m) */
+    WgrVec4 cloud3; /* x = weather scale (1/m), y = weather amount, z = warp scale (1/m), w = warp amount (m) */
 };
 
 /* Per-frame celestial + camera runtime (from LightSun / the camera). NOT an ImGui knob. */
@@ -436,7 +475,8 @@ struct WgrSkyRuntime
     WgrVec4 sun_dir;   /* xyz = unit dir TO the sun; w = pad */
     WgrVec4 moon_dir;  /* xyz = unit dir TO the moon; w = moon phase */
     WgrVec4 fog_color; /* xyz = scene fog colour; w = fog far-range (m) */
-    WgrVec4 misc;      /* x = night factor (0..1), y = camera altitude ASL (m), z/w = pad */
+    WgrVec4 misc;      /* x = night factor (0..1), y = camera altitude ASL (m), z/w = wind offset */
+    WgrVec4 cloud_evolve; /* x = shape, y = detail, z = weather drift (m, CPU-wrapped); w = pad */
 };
 
 /* Long-distance terrain sun-shadow sweep (was wgr_terrain_set_sun_shadow's args). */
@@ -480,6 +520,46 @@ struct WgrFoliage
     float _pad2;
 };
 
+/* Screen-space ambient occlusion (GTAO) — see docs/screen-space-ao-plan.md. Computed from the
+ * depth+normal prepass into an R8 buffer, bilateral-denoised, and multiplied into the AMBIENT
+ * term of terrain + objects (never the direct sun). Water is untouched. Default OFF. */
+struct WgrGtao
+{
+    uint32_t enabled;           /* 0 = pass skipped entirely; consumers read AO = 1 */
+    uint32_t debug;             /* raw view: 0 = off, 1 = AO greyscale, 2 = bent normal RGB */
+    float    radius_m;          /* occlusion reach in WORLD metres (projected per pixel) */
+    float    strength;          /* exponent on visibility; 1 = physical, >1 deepens */
+    uint32_t slices;            /* azimuthal directions per pixel */
+    uint32_t steps;             /* horizon-march steps per slice, per side */
+    float    max_radius_px;     /* screen-radius clamp (cost bound for near geometry) */
+    float    thickness;         /* falloff past the radius; rejects thin foreground occluders */
+    float    blur_radius;       /* bilateral denoise half-width in taps */
+    float    blur_depth_scale;  /* depth-difference rejection strength */
+    float    blur_normal_power; /* normal-difference rejection exponent */
+    uint32_t bent_normal;       /* 1 = steer sky irradiance by the bent normal (Stage 2) */
+    uint32_t max_mip;           /* highest mip the horizon march may use; 0 = full res only */
+};
+
+/* Interior sky visibility (LIT-020) — see docs/interior-sky-visibility-plan.md. A top-down
+ * orthographic depth map of the retained OBJECT set: a fragment with geometry above it loses sky
+ * AMBIENT toward `floor`. Distinct from WgrSkyVisibility, which is the terrain heightfield's baked
+ * sky-view factor and knows nothing about buildings. Direct sun and local lights are never
+ * touched. Default OFF. */
+struct WgrSkyVis
+{
+    uint32_t enabled;    /* 0 = no map, no cull view; consumers read reach = 1 */
+    uint32_t debug;      /* 1 = draw the reach factor as greyscale instead of lighting with it */
+    uint32_t resolution; /* depth-map edge in texels */
+    float extent;        /* HALF the world box, metres (2048 tex / 64 m half = 6 cm/texel) */
+    float height;        /* box half-height above/below the camera, metres */
+    float strength;      /* 0 = inert, 1 = full attenuation */
+    float floor;         /* minimum ambient multiplier in a sealed volume */
+    float kernel;        /* softening kernel radius, metres */
+    float bias;          /* depth bias, metres (stops open ground occluding itself) */
+    float directional;   /* 0 = uniform dimming, 1 = ambient arrives from the open direction */
+    uint32_t baked;      /* 1 = apply the per-model BAKED volumes (Stage 2) instead of the maps */
+};
+
 /* Every imgui-tweakable render parameter that crosses the FFI as a setter, in one block.
  * Append future look knobs here; do not add new FFI setters. */
 struct WgrRenderParams
@@ -490,6 +570,8 @@ struct WgrRenderParams
     WgrTerrainSunShadow terrain_sun_shadow;
     WgrSkyVisibility    sky_visibility;
     WgrFoliage          foliage;
+    WgrGtao             gtao;
+    WgrSkyVis           interior_sky;
 };
 
 /* Frame-global scalars carried in the camera UBO so the 3D shader can read them
@@ -642,6 +724,121 @@ struct WgrTerrainBatch
     uint32_t _pad;
 };
 
+/* One procedural grass draw for `camera`. Grass placement and instances are owned
+ * entirely by the Rust renderer; this batch only preserves the engine command
+ * stream and chooses the scene camera. */
+struct WgrGrassBatch
+{
+    uint32_t camera;
+    uint32_t flags;
+    uint32_t _pad0;
+    uint32_t _pad1;
+};
+
+enum { WGR_GRASS_TRACK_COUNT = 96 };
+enum { WGR_GRASS_DOWNWASH_COUNT = 4 };
+
+/* One persistent player/vehicle impression. Age is measured in seconds and
+ * faded on the GPU, so a trail remains after its source has moved away. */
+struct WgrGrassTrack
+{
+    float x;
+    float z;
+    float radius;
+    float age;
+};
+
+// Versioned size handshake performed before renderer construction. C++ fills
+// every field; Rust rejects a missing or stale structure instead of accepting
+// a binary pair that merely happens to link.
+struct WgrAbiCheck
+{
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t surface_desc_size;
+    uint32_t log_callbacks_size;
+    uint32_t frame_size;
+    uint32_t required_features;
+};
+
+/* A transient rotor-wash field. Unlike tracks this is rebuilt from the live
+ * helicopter list each frame, so grass springs upright as the aircraft leaves. */
+struct WgrGrassDownwash
+{
+    float x;
+    float z;
+    float radius;
+    float strength;
+};
+
+/* Live procedural-grass controls, edited through the developer Grass tab. */
+struct WgrGrassParams
+{
+    float density;  /* retained candidate fraction, 0..1 */
+    float spacing;  /* grid spacing in metres */
+    float near_radius; /* dense-placement radius in metres */
+    float enabled;  /* 0 = disabled, nonzero = enabled */
+    float blade_height;   /* blade-height multiplier */
+    float wind_strength;  /* test wind strength */
+    float wind_direction; /* test wind direction, degrees */
+    float far_radius;     /* coarse far-LOD radius */
+    float interactor_x;   /* live player/vehicle world-space centre */
+    float interactor_z;
+    float interactor_radius;
+    float interactor_strength;
+    WgrGrassTrack tracks[WGR_GRASS_TRACK_COUNT];
+    WgrGrassDownwash downwash[WGR_GRASS_DOWNWASH_COUNT];
+    float debug_ignore_geography_exclusions;
+    float clumping;        /* deterministic field-scale orientation/height/density variation */
+    float color_variation; /* per-blade and field colour variation */
+    float transmission;    /* backlit thin-blade scattering strength */
+    float cast_shadows;    /* 0 = omit close grass from cascade shadow maps */
+    float apply_fog;       /* 0 = leave procedural grass unfogged (diagnostic) */
+    float density_noise_scale;    /* coverage-noise frequency (1/metres) */
+    float density_noise_strength; /* 0 = uniform density; 1 = bare patches to dense clumps */
+    /* Species mix, as fractions of all placed plants. Grass takes the remainder,
+     * so weed + flower is clamped to <= 1. Selection is per clump, not per blade. */
+    float weed_percent;
+    float flower_percent;
+    /* Blade width multiplier, 1.0 = stock. Wider blades give the near-LOD texture
+     * pixels to land in: a 3 cm blade is only ~4 px on screen, where a 64 px-wide
+     * texture averages to flat colour before it is ever drawn. */
+    float blade_width_scale;
+    /* 0 = mid LOD keeps the procedural ribbons (default); nonzero = photo tuft cards. */
+    float use_photo_tuft;
+    /* Grass albedo saturation about its luma. 1.0 = untouched, 0.0 = greyscale.
+     * Applied to near blades, mid ribbons/clump cards and the far proxy alike. */
+    float saturation;
+    /* Sun-bleached patches: fraction of the field that dries toward straw, and
+     * the patch size (noise frequency, 1/metres). */
+    float dry_patches;
+    float dry_patch_scale;
+    float _pad3;
+    /* Blade shape controls. The four grass species used to share ONE silhouette,
+     * so a field read as the same blade repeated; shape_variety blends from that
+     * legacy behaviour (0) to eight distinct profiles (1), and the two jitters
+     * add per-blade taper/bend spread on top. Continuous so the Grass tab can
+     * A/B against the old look without a rebuild. */
+    float shape_variety;
+    float taper_jitter;
+    float bend_jitter;
+    /* Global scale on the near-LOD photo atlas, on top of its distance fade.
+     * 0 = ignore the photo entirely and keep the procedural surface. */
+    float blade_texture_strength;
+    /* Alpha cut-out cards: silhouette from the texture instead of the quad, which
+     * buys shape variety without more geometry but costs early-Z and adds
+     * overdraw. Off by default; measure before adopting. card_widen widens the
+     * quad so the cutout has material to remove. */
+    float alpha_cards;
+    float alpha_cutoff;
+    float card_widen;
+    /* How far a blade arcs over, as a multiple of its own height. The stock bend moved a tip
+       5-19 cm on a ~0.8 m blade -- about ten degrees -- which read as a field of rigid spikes.
+       Taller blades arc further, so this scales with height rather than being a fixed distance.
+       0 restores the old rigid look. */
+    float blade_arch;
+};
+
 // --- Water (GPU CDLOD surface) -----------------------------------------------
 
 /* Per-map + per-frame water parameters (a small UBO). `world_origin`/`terrain_grid`/
@@ -685,7 +882,245 @@ struct WgrWaterParams
     float foam_intensity;
     float swash_amp;
     float swash_speed;
+    /* Shared FFT ocean controls. fft_control = enabled, deterministic seed, minimum geometry
+     * wavelength, pad. fft_wind_sea = wind x/z, speed (m/s), sea state (0..1). The four
+     * cascade lengths are world metres and must remain stable across camera-origin changes.
+     * WTR-001 — the "minimum geometry wavelength" lane (fft_control.z) was set once by the
+     * C++ ctor to 12.0f but never read on the Rust/shader side, so it is repurposed as the
+     * WTR freeze mask: WGR_WATER_FREEZE_* bits OR-ed together. 0.0 (no freeze) preserves the
+     * legacy default (a harmless constant float the shaders ignore); the Rust side reads the
+     * float's bit pattern as the mask only for its own dispatch skip, never as a wavelength. */
+    WgrVec4 fft_control;
+    WgrVec4 fft_wind_sea;
+    WgrVec4 fft_cascade_lengths;
+    /* Optional directed surface flow. xy is world-xz direction, z is metres/second and w is
+     * WgrWaterKind. Zero is the established global ocean behavior. The current CDLOD API has
+     * one global material, so river producers must not set this until per-water-body batches exist. */
+    WgrVec4 flow_direction_speed;
+    /* WTR-003 — water debug views (dev-only; the Water tab "Debug views" section). x is the
+     * WgrWaterDebugView index (0 = normal shading); the fragment shader replaces its output
+     * with the selected diagnostic when non-zero. y gates the GPU whitewater/spray billboard
+     * pass and z controls its activity. w is the live viewport height in pixels, consumed by
+     * the shader's per-cascade projected-pixel filtering. Appended at the struct end so the
+     * existing lanes keep their offsets; the sizeof assert below moves 192 -> 208 in lockstep
+     * with the Rust side. */
+    WgrVec4 debug_params;
+    /* WTR-LOOK — surface energy model + its gains (the Water tab "Surface look" section).
+     * x selects the composite: 0 = legacy (capped Fresnel, 0.12x specular, SSS multiplied by the
+     * body colour), 1 = physical (uncapped Fresnel, variance-filtered GGX sun glitter at full
+     * radiance, SSS as its own light path). y/z/w are artist gains on glitter / subsurface
+     * scattering / environment reflection, 1.0 = the model's own energy. Appended at the struct
+     * end so every earlier lane keeps its offset; sizeof moves 208 -> 224 with the Rust side. */
+    WgrVec4 look_params;
+    /* WTR-LOOK — sea state, quality and shore-wave lanes.
+     * x: 1 = the amplitude control drives a physically coupled sea state (cascade wind speed and
+     *    tile lengths scale together, so a taller sea is also a LONGER sea), 0 = legacy uniform
+     *    variance scaling (taller waves at an unchanged wavelength — steepness, not sea state).
+     * y: residual spectrum amplitude the h0 pass should apply. 1.0 when the coupling above already
+     *    carries the energy; the raw amplitude in legacy mode. Squared by the spectrum (variance).
+     * z: 1 = low water quality (drops SSR, planar reflection, bicubic filtering and the two
+     *    smallest cascades in the water fragment shader). 0 = full quality.
+     * w: shore breaker gain. Appended at the struct end; sizeof moves 224 -> 240 with Rust. */
+    WgrVec4 sea_params;
+    /* Underwater tuning, all live from the Water tab's "Underwater effect" section so the look
+     * can be dialled in without a rebuild. These do nothing while the effect is off.
+     * x: engage band in metres. The compositor runs while the camera is below sea level + this,
+     *    so it can still classify a view that straddles the surface. Raising it past the crest
+     *    height engages the pass in open air, which costs the froxel and caustic dispatches for
+     *    a frame that returns no water path.
+     * y: density multiplier on the absorption. 1.0 = the tuned default.
+     * z: colour bias, 0..1. 1 = absorption hue derived entirely from the authored deep swatch,
+     *    so the volume matches the surface; 0 = the neutral (0.280, 0.065, 0.020) curve the
+     *    effect used before, which had no relation to the water you swam into.
+     * w: caustic gain, 1.0 = the tuned CAUSTIC_STRENGTH.
+     * Appended at the struct end; sizeof moves 240 -> 256 with the Rust side. */
+    WgrVec4 underwater_params;
+    /* x: 1 = the underwater effect is enabled, 0 = off. THIS is what switches the compositor.
+     *
+     * It needs its own lane because the effect has two independent triggers and the Water tab
+     * must own both. `fft_control.w` (eye submersion depth) drives the water shader's own
+     * underwater tint, but the fullscreen compositor engages on EITHER that depth or the camera
+     * being within the engage band of sea level — and the band test has no idea whether the
+     * effect is wanted. Gating only the depth left the compositor running with the checkbox off,
+     * because a submerged camera is always inside the band.
+     * yzw reserved. Appended at the struct end; sizeof moves 256 -> 272 with the Rust side. */
+    WgrVec4 underwater_gate;
 };
+
+struct WgrWaterCascadeConfig
+{
+    uint32_t enabled;
+    uint32_t resolution; /* live FFT tier: 256, 512, or Godot-reference 1024 */
+    float tile_length_x;
+    float tile_length_y;
+    float displacement_scale;
+    float horiz_displacement_scale;
+    float normal_scale;
+    float foam_scale;
+    float wind_speed;
+    float wind_direction_rad;
+    float fetch_meters;
+    float water_depth_meters;
+    float swell;
+    float directional_spread;
+    float short_wave_detail;
+    float whitecap_threshold;
+    uint32_t spectrum_seed;
+    float phase_offset_seconds;
+    /* Reserved for WTR-185 (reduced-rate cascade update scheduling with interpolation).
+     * Currently unused: every enabled cascade evolves every frame. Kept in the ABI so the
+     * scheduling work does not need a struct change later. */
+    float update_rate_hz;
+    float pad;
+};
+
+constexpr uint32_t WGR_MAX_WATER_INTERACTIONS = 48;
+
+/* WTR-001 — deterministic water freeze mask, OR-ed into WgrWaterParams.fft_control.z.
+ * The freeze flags reflect the dev-only `Engine::WaterSettings::Freeze` block (the Water
+ * tab's Debug section). The Rust side reads the float's bit pattern in
+ * `Water::update_interactions` and skips the matching dispatch, so a frozen frame repeats
+ * its last water state instead of advancing through a no-advancement compute pass. */
+enum WgrWaterFreezeBits : uint32_t
+{
+    WGR_WATER_FREEZE_FFT = 1u << 0,           // skip Fft::dispatch (spectrum holds at last h0/time)
+    WGR_WATER_FREEZE_INTERACTION = 1u << 1,    // skip Interaction::dispatch
+    WGR_WATER_FREEZE_FOAM = 1u << 2,          // skip Foam::dispatch
+};
+
+/* WTR-002 — GPU timestamp regions, the index contract of wgr_get_gpu_timings (mirrors
+ * `Region` in rust/src/gpu_timers.rs — append only, never reorder). Regions marked
+ * "reserved" name spec rows whose standalone pass doesn't exist yet; they always report
+ * -1 ms ("n/a") so the tab rows + ABI are already in place when those passes land.
+ * SSR/refraction remain fragment work inside WATER_DRAW. */
+enum WgrGpuTimerRegion : uint32_t
+{
+    WGR_GPU_TIMER_SPECTRUM_INIT = 0,        // h0 spectrum generation (spectrum-dirty frames only)
+    WGR_GPU_TIMER_SPECTRUM_EVOLVE = 1,      // per-frame spectrum evolution
+    WGR_GPU_TIMER_FFT_HORIZONTAL = 2,       // FFT butterfly stages, axis 0
+    WGR_GPU_TIMER_FFT_VERTICAL = 3,         // FFT butterfly stages, axis 1
+    WGR_GPU_TIMER_FFT_COMPOSE = 4,          // displacement/dynamics/auxiliary composition
+    WGR_GPU_TIMER_INTERACTION = 5,          // injection + propagation (one fused kernel today)
+    WGR_GPU_TIMER_FOAM = 6,                 // persistent foam update
+    WGR_GPU_TIMER_WHITEWATER = 7,           // reserved — no whitewater pass yet
+    WGR_GPU_TIMER_PLANAR_SKY = 8,           // planar reflection: sky
+    WGR_GPU_TIMER_PLANAR_TERRAIN = 9,       // planar reflection: terrain
+    WGR_GPU_TIMER_PLANAR_OBJECTS = 10,      // planar reflection: reflected cull + objects
+    WGR_GPU_TIMER_PLANAR_CLOUDS = 11,       // planar reflection: cloud march + composite
+    WGR_GPU_TIMER_PLANAR_MIPS = 12,         // planar reflection mip generation
+    WGR_GPU_TIMER_WATER_SSR = 13,           // reserved — in-shader inside WATER_DRAW
+    WGR_GPU_TIMER_WATER_REFRACTION = 14,    // reserved — in-shader inside WATER_DRAW
+    WGR_GPU_TIMER_WATER_DRAW = 15,          // water surface pass (includes SSR + refraction)
+    WGR_GPU_TIMER_UNDERWATER_FROXEL = 16,   // camera frustum volume lighting compute
+    WGR_GPU_TIMER_UNDERWATER_COMPOSITE = 17, // fullscreen waterline-aware compositor
+    WGR_GPU_TIMER_CAUSTICS = 18,            // FFT-derived camera-centred caustic compute
+    /* Water rows end here; the Water tab slices [0, WATER_REGION_COUNT). */
+    WGR_GPU_TIMER_WATER_REGION_COUNT = 19,
+    /* GRS-A — grass. The three placement dispatches are standalone compute passes and
+     * bracket on the encoder. The draw rows share a render pass with the rest of the
+     * 3D plan, so they need TIMESTAMP_QUERY_INSIDE_PASSES and read "n/a" without it. */
+    WGR_GPU_TIMER_GRASS_PLACE_NEAR = 19,    // cs_place dispatch (512x512 candidates)
+    WGR_GPU_TIMER_GRASS_PLACE_MID = 20,     // cs_place_mid dispatch (384x384)
+    WGR_GPU_TIMER_GRASS_PLACE_FAR = 21,     // cs_place_far dispatch (384x384)
+    WGR_GPU_TIMER_GRASS_PREPASS = 22,       // grass depth/normal prepass (near + mid)
+    WGR_GPU_TIMER_GRASS_COLOR = 23,         // grass colour pass (far + mid + near)
+    WGR_GPU_TIMER_GRASS_SHADOW = 24,        // near blades into the cascade depth map
+    WGR_GPU_TIMER_FRAME_TOTAL = 25,         // all submitted frame work (excludes acquire/present pacing)
+    /* LIT-020 — interior sky visibility. Appended after FRAME_TOTAL rather than inserted next to
+     * it: these indices are the FFI contract the debug tabs slice by, so renumbering silently
+     * relabels every existing row. */
+    WGR_GPU_TIMER_INTERIOR_SKY_CULL = 26, // one cull dispatch chain per sampled sky direction
+    WGR_GPU_TIMER_INTERIOR_SKY_DRAW = 27, // the per-direction depth passes that fill the map
+    /* LIT-010 — screen-space AO, split so the three stages can be attributed separately. */
+    WGR_GPU_TIMER_GTAO_PREP = 28,    // depth resolve + normal resolve + linear-Z mip chain
+    WGR_GPU_TIMER_GTAO_COMPUTE = 29, // the horizon march (scales with slices x steps)
+    WGR_GPU_TIMER_GTAO_BLUR = 30,    // bilateral denoise (scales with blur radius)
+    WGR_GPU_TIMER_REGION_COUNT = 31,
+};
+
+/* GRS-A — grass instance accounting (mirrors WgrGrassStats in rust/src/ffi.rs).
+ * Read back asynchronously from the three atomic placement counters, so the values
+ * lag the displayed frame by the readback ring depth (~2-3 frames). `candidates`
+ * are the fixed dispatch sizes, so accepted/candidates is the acceptance rate. */
+struct WgrGrassStats
+{
+    uint32_t near_instances;
+    uint32_t mid_instances;
+    uint32_t far_instances;
+    uint32_t near_candidates;
+    uint32_t mid_candidates;
+    uint32_t far_candidates;
+    uint32_t near_vertices;
+    uint32_t mid_vertices;
+    uint32_t far_vertices;
+};
+
+enum WgrWaterKind : uint32_t { WGR_WATER_KIND_OCEAN = 0, WGR_WATER_KIND_RIVER = 1 };
+/* WTR-003 — water debug view selector, written to WgrWaterParams.debug_params.x. The water
+ * fragment shader maps these to on-surface diagnostics; 0 is normal shading. Views whose
+ * backing pass does not exist yet (the whitewater pool/overflow diagnostics) are listed
+ * for a stable UI but render black until those passes land. The
+ * ordering mirrors the Water tab combo and the shader's debug_view() switch. */
+enum WgrWaterDebugView : uint32_t
+{
+    WGR_WATER_DEBUG_OFF = 0,                 // normal shading
+    WGR_WATER_DEBUG_FFT_DISPLACEMENT = 1,    // |displacement.xyz| summed over cascades
+    WGR_WATER_DEBUG_FFT_HORIZONTAL = 2,      // horizontal displacement magnitude (xz)
+    WGR_WATER_DEBUG_FFT_VERTICAL = 3,        // vertical displacement (y), signed heatmap
+    WGR_WATER_DEBUG_FFT_SLOPE = 4,           // |dynamics.xy| slope magnitude
+    WGR_WATER_DEBUG_JACOBIAN = 5,            // auxiliary.x Jacobian (1 = unfolded)
+    WGR_WATER_DEBUG_COMPRESSION = 6,         // auxiliary.y horizontal compression
+    WGR_WATER_DEBUG_CURVATURE = 7,           // auxiliary.z positive curvature
+    WGR_WATER_DEBUG_CREST_ENERGY = 8,        // displacement.w crest energy
+    WGR_WATER_DEBUG_SLOPE_VARIANCE = 9,      // auxiliary.w resolved slope variance
+    WGR_WATER_DEBUG_MATERIAL_COORD = 10,     // undisplaced base xz (uv of the domain)
+    WGR_WATER_DEBUG_DISPLACED_COORD = 11,    // displaced world xz
+    WGR_WATER_DEBUG_INTERACTION_HEIGHT = 12, // interaction field .r (signed heatmap)
+    WGR_WATER_DEBUG_INTERACTION_VELOCITY = 13, // interaction field .g (signed heatmap)
+    WGR_WATER_DEBUG_INTERACTION_FOAM = 14,   // interaction field .b aeration
+    WGR_WATER_DEBUG_FOAM_SOURCE = 15,        // breaker source (fft gates + aeration)
+    WGR_WATER_DEBUG_FOAM_HISTORY = 16,       // persistent foam coverage (history .r)
+    WGR_WATER_DEBUG_SURFACE_VELOCITY = 17,   // interaction velocity as a flow vector
+    WGR_WATER_DEBUG_WATER_DEPTH = 18,        // reconstructed water-column depth
+    WGR_WATER_DEBUG_CAMERA_DISTANCE = 19,    // camera-to-surface distance
+    WGR_WATER_DEBUG_SSR_COLOR = 20,          // screen-space reflection colour
+    WGR_WATER_DEBUG_SSR_CONFIDENCE = 21,     // SSR hit weight
+    WGR_WATER_DEBUG_PLANAR_COLOR = 22,       // planar reflection colour
+    WGR_WATER_DEBUG_PLANAR_VALIDITY = 23,    // planar reflection validity
+    WGR_WATER_DEBUG_SKY_REFLECTION = 24,     // directional sky/cloud reflection
+    WGR_WATER_DEBUG_REFLECTION_SOURCE = 25,  // final reflection-source selection (rgb coded)
+    WGR_WATER_DEBUG_REFRACTION_RAY = 26,     // refraction uv offset (pixel space)
+    WGR_WATER_DEBUG_REFRACTION_VALIDITY = 27,// refracted scene hit validity
+    WGR_WATER_DEBUG_REFRACTION_PATH = 28,    // refraction path length (column depth)
+    WGR_WATER_DEBUG_TRANSMITTANCE = 29,      // RGB transmittance
+    WGR_WATER_DEBUG_UNDERWATER_EXTINCTION = 30,  // froxel RGB transmission
+    WGR_WATER_DEBUG_UNDERWATER_INSCATTER = 31,   // froxel in-scattered radiance
+    WGR_WATER_DEBUG_GODRAY_VISIBILITY = 32,      // terrain + cascade shadow visibility
+    WGR_WATER_DEBUG_CAUSTIC_INTENSITY = 33,      // FFT-derived caustic intensity
+    WGR_WATER_DEBUG_WHITEWATER_STATE = 34,       // reserved — no whitewater pass yet
+    WGR_WATER_DEBUG_WHITEWATER_POOL = 35,        // reserved — no whitewater pass yet
+    WGR_WATER_DEBUG_PARTICLE_OVERFLOW = 36,      // reserved — no whitewater pass yet
+    WGR_WATER_DEBUG_SURFACE_SPEED = 37,          // WTR-012 — |interaction velocity| heatmap
+    /* WTR-012 — |interaction height| heatmap. Named PREV_DISP_DELTA when it was believed to show
+     * a previous-displacement delta; nothing stores one (the interaction field is height,
+     * velocity, foam, unused), so it actually drew the velocity channel again on a second scale
+     * while the height channel had no view. The name is kept for ABI stability — this is a
+     * wire-visible enum — and corrected here and in the overlay label. */
+    WGR_WATER_DEBUG_PREV_DISP_DELTA = 38,
+    WGR_WATER_DEBUG_WTR40_DIR_SKY = 39,          // WTR-040 — directional atmosphere only
+    WGR_WATER_DEBUG_WTR40_DIR_CLOUDS = 40,       // WTR-040 — directional cloud contribution
+    WGR_WATER_DEBUG_WTR40_PLANAR_SKY = 41,       // WTR-040 — planar sky only
+    WGR_WATER_DEBUG_WTR40_PLANAR_CLOUDS = 42,    // WTR-040 — planar cloud contribution
+    WGR_WATER_DEBUG_WTR40_PLANAR_GEOM = 43,      // WTR-040 — planar terrain/objects only
+    WGR_WATER_DEBUG_WTR40_PLANAR_VALIDITY = 44,  // WTR-040 — planar geometry validity mask
+    WGR_WATER_DEBUG_WTR40_SSR_ONLY = 45,         // WTR-040 — SSR only
+    WGR_WATER_DEBUG_WTR40_OWNER_BADGE = 46,      // WTR-040 — final reflection owner (R=SSR, B=planar, G=directional)
+    WGR_WATER_DEBUG_VIEW_COUNT = 47,
+};
+enum WgrWaterInteractionKind : uint32_t { WGR_WATER_INTERACTION_BULLET = 0, WGR_WATER_INTERACTION_OBJECT = 1, WGR_WATER_INTERACTION_PLAYER = 2, WGR_WATER_INTERACTION_EXPLOSION = 3, WGR_WATER_INTERACTION_FOOTSTEP = 4, WGR_WATER_INTERACTION_CONTINUOUS = 5 };
+enum WgrWaterInteractionFlags : uint32_t { WGR_WATER_INTERACTION_PENDING_IMPULSE = 1u << 0, WGR_WATER_INTERACTION_CAPSULE = 1u << 8, WGR_WATER_INTERACTION_PLAYER_WADING = 1u << 9, WGR_WATER_INTERACTION_PLAYER_SWIMMING = 1u << 10, WGR_WATER_INTERACTION_LEFT_SIDE = 1u << 11, WGR_WATER_INTERACTION_LARGE_BODY = 1u << 12 };
+struct alignas(16) WgrWaterInteractionEvent { WgrVec4 position_radius, velocity_kind, time_life_foam_mass, direction_depth_flags; };
+struct alignas(16) WgrWaterInteractionParams { WgrVec4 domain, previous_domain, grid, physics, misc, weather; };
 
 /* One water node instance: byte-identical to WgrTerrainNode (the shared grid mesh
  * placed at world-xz `origin`, `size` x `size`, level `lod`, morphing over the
@@ -698,6 +1133,12 @@ struct WgrWaterNode
     uint32_t lod;
     float morph_start;
     float morph_end;
+    /* CPU-derived direction from the nearby shallow-water tile toward the closest
+     * shore, plus a 0..1 shallow/coast weight.  This lets the vertex shader add a
+     * shoreward breaker train without rotating the global open-ocean FFT field. */
+    WgrVec2 shore_direction;
+    float shore_factor;
+    float _shore_pad;
 };
 
 /* A run [first_node, first_node+node_count) of WgrFrame.water_nodes drawn with the
@@ -780,6 +1221,10 @@ struct WgrFrame
      * per-frame sea level) are uploaded separately via wgr_water_set_params. */
     WgrSlice<WgrWaterNode> water_nodes;
     WgrSlice<WgrWaterBatch> water_batches;
+
+    /* Procedural GPU grass, drawn on WGR_CMD_DRAW_GRASS. Static placement
+     * metadata is uploaded separately via wgr_grass_set_geography. */
+    WgrSlice<WgrGrassBatch> grass_batches;
 };
 
 // --- Layout guards (mirror rust/src/ffi.rs) ----------------------------------
@@ -788,6 +1233,8 @@ static_assert(sizeof(WgrVec2) == 8, "WgrVec2 must be 2 floats");
 static_assert(sizeof(WgrVec3) == 12, "WgrVec3 must be 3 floats");
 static_assert(sizeof(WgrVec4) == 16, "WgrVec4 must be 4 floats");
 static_assert(sizeof(WgrMat4) == 64, "WgrMat4 must be 16 floats");
+static_assert(sizeof(WgrSurfaceDesc) == 32, "WgrSurfaceDesc must match Rust on 64-bit targets");
+static_assert(sizeof(WgrLogCallbacks) == 16, "WgrLogCallbacks must match Rust on 64-bit targets");
 static_assert(sizeof(WgrSlice<WgrCamera>) == 16 && alignof(WgrSlice<WgrCamera>) == 8,
               "WgrSlice must be a { pointer, u32 } with 8-byte alignment");
 static_assert(sizeof(WgrBlend) == 4, "WgrBlend must be 4 bytes to match the Rust #[repr(u32)] enum");
@@ -798,13 +1245,15 @@ static_assert(sizeof(WgrDraw3D) == 264, "WgrDraw3D layout must match the Rust #[
 static_assert(sizeof(WgrLight) == 64, "WgrLight layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrTonemap) == 48, "WgrTonemap layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrExposure) == 32, "WgrExposure layout must match the Rust #[repr(C)] struct");
-static_assert(sizeof(WgrSky) == 176, "WgrSky layout must match the Rust #[repr(C)] struct");
-static_assert(sizeof(WgrSkyLook) == 128, "WgrSkyLook layout must match the Rust #[repr(C)] struct");
-static_assert(sizeof(WgrSkyRuntime) == 64, "WgrSkyRuntime layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrSky) == 256, "WgrSky layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrSkyLook) == 192, "WgrSkyLook layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrSkyRuntime) == 80, "WgrSkyRuntime layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrTerrainSunShadow) == 16, "WgrTerrainSunShadow layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrSkyVisibility) == 32, "WgrSkyVisibility layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrFoliage) == 48, "WgrFoliage layout must match the Rust #[repr(C)] struct");
-static_assert(sizeof(WgrRenderParams) == 304, "WgrRenderParams layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrGtao) == 52, "WgrGtao layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrSkyVis) == 44, "WgrSkyVis layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrRenderParams) == 464, "WgrRenderParams layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrFrameParams) == 16, "WgrFrameParams layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrCameraShadow) == 352, "WgrCameraShadow layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrCamera) == 576, "WgrCamera layout must match the Rust #[repr(C)] struct");
@@ -816,22 +1265,37 @@ static_assert(sizeof(WgrOverlayDraw) == 40, "WgrOverlayDraw layout must match th
 static_assert(sizeof(WgrTerrainParams) == 64, "WgrTerrainParams layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrTerrainNode) == 24, "WgrTerrainNode layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrTerrainBatch) == 16, "WgrTerrainBatch layout must match the Rust #[repr(C)] struct");
-static_assert(sizeof(WgrWaterParams) == 128, "WgrWaterParams layout must match the Rust #[repr(C)] struct");
-static_assert(sizeof(WgrWaterNode) == 24, "WgrWaterNode layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrGrassBatch) == 16, "WgrGrassBatch layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrGrassTrack) == 16, "WgrGrassTrack layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrGrassDownwash) == 16, "WgrGrassDownwash layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrGrassParams) == 1744, "WgrGrassParams layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrWaterParams) == 272, "WgrWaterParams layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrWaterNode) == 40, "WgrWaterNode layout must match the Rust #[repr(C)] struct");
 static_assert(sizeof(WgrWaterBatch) == 16, "WgrWaterBatch layout must match the Rust #[repr(C)] struct");
-static_assert(sizeof(WgrFrame) == 560, "WgrFrame layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrWaterInteractionEvent) == 64 && alignof(WgrWaterInteractionEvent) == 16, "WgrWaterInteractionEvent must match Rust");
+static_assert(sizeof(WgrWaterInteractionParams) == 96 && alignof(WgrWaterInteractionParams) == 16, "WgrWaterInteractionParams must match Rust");
+static_assert(sizeof(WgrFrame) == 576, "WgrFrame layout must match the Rust #[repr(C)] struct");
+static_assert(sizeof(WgrAbiCheck) == 24, "WgrAbiCheck layout must match Rust");
 
 // --- Functions ---------------------------------------------------------------
 
 extern "C"
 {
     WGR_API const char* wgr_version(void);
+    WGR_API uint32_t wgr_abi_version(void);
+    WGR_API const char* wgr_build_id(void);
+    WGR_API int32_t wgr_abi_validate(const WgrAbiCheck* check);
+    WGR_API void wgr_screenshot_request(WgrRenderer* renderer);
+    WGR_API uint32_t wgr_screenshot_take(WgrRenderer* renderer, uint8_t* out, uint32_t out_len, uint32_t* width,
+                                          uint32_t* height);
 
     /* Returns NULL on failure (reason reported via `log` if supplied). `log` may be NULL. */
     WGR_API WgrRenderer* wgr_create(const WgrSurfaceDesc* desc, const WgrLogCallbacks* log);
 
     WGR_API void wgr_destroy(WgrRenderer* renderer);
     WGR_API void wgr_resize(WgrRenderer* renderer, uint32_t width, uint32_t height);
+    /* Presentation interval: 0 = immediate/no VSync, 1 = FIFO/VSync, -1 = adaptive. */
+    WGR_API int32_t wgr_set_present_mode(WgrRenderer* renderer, int32_t interval);
 
     /* Upload a texture in `format` (WgrTextureFormat); returns a non-zero id, or
      * 0 on failure. `data` holds `mip_count` tightly packed mip levels, level i
@@ -970,6 +1434,27 @@ extern "C"
      * Handle 0 is ignored (the neutral built-in stand-in stays). */
     WGR_API void wgr_terrain_set_detail_layer(WgrRenderer* renderer, WgrTexture handle);
 
+    /* Upload one GeographyInfo::packed value per land cell. Grass uses the
+     * existing authoritative water/road/forest/obstacle classification before
+     * attempting any optional artist-authored exclusion masks. */
+    WGR_API void wgr_grass_set_geography(WgrRenderer* renderer, uint32_t width, uint32_t height,
+                                         const uint32_t* geography);
+    WGR_API void wgr_grass_set_params(WgrRenderer* renderer, const WgrGrassParams* params);
+
+    /* GRS-E — upload the photographed grass-tuft texture used by the mid LOD's crossed
+     * cards. `rgba` is width*height RGBA8 (the game's own PAA/PAC decoded through
+     * DecodePAABuffer). Cutout alpha: the mid fragment shader alpha-tests it. Passing
+     * width or height 0 clears it, and the mid ring falls back to procedural ribbons. */
+    WGR_API void wgr_grass_set_tuft(WgrRenderer* renderer, uint32_t width, uint32_t height,
+                                    const uint8_t* rgba);
+
+    /* Upload opaque, modern-PNG blade-surface layers for the near grass geometry.
+     * `rgba` is layer-major, with `layers` same-sized width*height RGBA8 images.
+     * The blade mesh supplies the silhouette, so alpha is ignored and no discard
+     * is enabled by this path. */
+    WGR_API void wgr_grass_set_blade_atlas(WgrRenderer* renderer, uint32_t width, uint32_t height,
+                                           uint32_t layers, const uint8_t* rgba);
+
     /* The terrain sun-shadow and sky-visibility knobs are pushed through the consolidated
      * WgrRenderParams block (wgr_set_render_params), not their own setters. See below and
      * docs/render-params-consolidation-plan.md. */
@@ -978,6 +1463,11 @@ extern "C"
      * map load and each frame to update the animated `sea_level`. */
     WGR_API void wgr_water_set_params(WgrRenderer* renderer, const WgrWaterParams* params);
 
+    /* Set per-cascade configuration (0..7). Spectrum initialisation regenerates when spectrum parameters change. */
+    WGR_API void wgr_water_set_cascade_config(WgrRenderer* renderer, uint32_t index, const WgrWaterCascadeConfig* config);
+    WGR_API void wgr_water_set_interaction_params(WgrRenderer* renderer, const WgrWaterInteractionParams* params);
+    WGR_API void wgr_water_submit_interactions(WgrRenderer* renderer, const WgrWaterInteractionEvent* events, uint32_t count);
+
     /* Render + present one frame. Returns 0 on success (incl. transient skipped
      * frames), negative on error. */
     WGR_API int32_t wgr_render_frame(WgrRenderer* renderer, const WgrFrame* frame);
@@ -985,11 +1475,36 @@ extern "C"
     /* Debug: read back the current auto-exposure scale (blocking GPU sync; dev panel only). */
     WGR_API float wgr_get_exposure_scale(WgrRenderer* renderer);
 
+    /* WTR-002 — copy the latest completed-frame GPU pass timings into `out_ms`
+     * (milliseconds per region, indexed by WgrGpuTimerRegion; -1 = pass never ran /
+     * reserved). Non-blocking — values are harvested asynchronously by the renderer
+     * each frame. Returns the region count written (min of WGR_GPU_TIMER_REGION_COUNT
+     * and out_len), or 0 when the adapter lacks timestamp queries. */
+    WGR_API uint32_t wgr_get_gpu_timings(WgrRenderer* renderer, float* out_ms, uint32_t out_len);
+
+    /* GRS-A — latest grass instance counts. Returns 1 on success, 0 when unavailable. */
+    WGR_API uint32_t wgr_get_grass_stats(WgrRenderer* renderer, WgrGrassStats* out);
+
     /* Push the consolidated ImGui-tweakable render params (tonemap, exposure, sky look,
      * terrain sun-shadow, sky-visibility) in one block. The two terrain setters are diffed
      * renderer-side against the last block, so a per-frame push doesn't thrash the sweep/scan.
      * See docs/render-params-consolidation-plan.md. */
     WGR_API void wgr_set_render_params(WgrRenderer* renderer, const WgrRenderParams* params);
+
+    /* CLD-020: strength of the cloud shadow the deck casts on terrain, objects, grass and water.
+       0 = off (every surface reads fully lit); 1 = the full computed transmittance. Its own entry
+       point rather than a field in WgrSkyLook, because growing that struct changes a size the ABI
+       handshake checks and this is one float. */
+    /* How much wider the planar water reflection's frustum is than the screen's. 1 = the old
+       behaviour, where a grazing reflection ran off the edge of the reflection target and the
+       reflected clouds ended in a visible line. Higher covers more angle at lower resolution. */
+    WGR_API void wgr_set_planar_reflection_pad(WgrRenderer* renderer, float pad);
+
+    /* Brightness of the procedural star field. 0 = none. Gated to night by sun altitude in the
+       shader, so it never affects a daytime sky. */
+    WGR_API void wgr_set_star_intensity(WgrRenderer* renderer, float intensity);
+
+    WGR_API void wgr_set_cloud_shadow_strength(WgrRenderer* renderer, float strength);
 
     /* Push the per-frame sky runtime (celestial dir/phase, night factor, fog colour, camera
      * altitude, fog range) — the runtime half of the sky UBO; the look half comes from

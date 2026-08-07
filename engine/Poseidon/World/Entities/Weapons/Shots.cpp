@@ -12,6 +12,9 @@
 #include <Poseidon/AI/AI.hpp>
 #include <Poseidon/World/Entities/Weapons/Weapons.hpp>
 #include <Poseidon/Network/Network.hpp>
+#include <Poseidon/Graphics/Rendering/WaterInteractionBridge.hpp>
+#include <Poseidon/Graphics/Rendering/Effects/Smokes.hpp>
+#include <Poseidon/World/Entities/Vehicles/Vehicle.hpp>
 #include <Poseidon/Graphics/Textures/TexturePreload.hpp>
 #include <Poseidon/Graphics/Rendering/Draw/SpecLods.hpp>
 #include <Poseidon/World/Scene/ObjLine.hpp>
@@ -624,6 +627,7 @@ ShotShell::ShotShell(EntityAI* parent, const AmmoType* type) : base(parent, type
             _timeToLive = *entry;
         }
     }
+    _waterImpactDone = false;
 }
 
 bool ShotShell::Invisible() const
@@ -756,12 +760,79 @@ void ShotShell::Simulate(float deltaT, SimulationImportance prec)
             float maxDist = lDir * lDirNorm;
 
             Vector3 isect;
-            float t = GLandscape->IntersectWithGroundOrSea(&isect, lPos, lDirNorm, 0, maxDist * 1.1);
+            bool hitSea = false;
+            float t = GLandscape->IntersectWithGroundOrSea(&isect, hitSea, lPos, lDirNorm, 0, maxDist * 1.1);
+
+            if (!_waterImpactDone)
+            {
+                const float seaLevel = GLandscape->GetSeaLevel();
+
+                // Check if bullet segment crossed the sea surface or hit sea geometry
+                const bool segmentCrossedSea = (lPos.Y() > seaLevel && position.Y() <= seaLevel) ||
+                                               (lPos.Y() <= seaLevel && position.Y() > seaLevel);
+                if (hitSea || segmentCrossedSea || (t <= maxDist && isect.Y() <= seaLevel + 0.3f))
+                {
+                    _waterImpactDone = true;
+                    const Vector3 waterPoint =
+                        (hitSea || segmentCrossedSea)
+                            ? Vector3(lPos.X() + lDirNorm.X() * t, seaLevel, lPos.Z() + lDirNorm.Z() * t)
+                            : isect;
+                    HydroWaterInteractionEvent event{};
+                    event.positionRadius[0] = waterPoint.X();
+                    event.positionRadius[1] = waterPoint.Z();
+                    event.positionRadius[2] = Type()->explosive ? 3.5f : 1.8f; // Radius
+                    event.positionRadius[3] = Type()->explosive ? 4.5f : 3.8f; // Strength
+                    event.velocityKind[0] = lDirNorm.X() * 15.0f;
+                    event.velocityKind[1] = lDirNorm.Z() * 15.0f;
+                    event.velocityKind[2] = -25.0f; // Downward entry velocity
+                    event.velocityKind[3] =
+                        Type()->explosive ? HydroWaterInteractionExplosion : HydroWaterInteractionBullet;
+                    event.timeLifeFoamMass[1] = 1.8f;
+                    event.timeLifeFoamMass[2] = 1.0f; // Foam density
+                    event.directionDepthFlags[0] = lDirNorm.X();
+                    event.directionDepthFlags[1] = lDirNorm.Z();
+                    event.directionDepthFlags[3] = HydroWaterInteractionPendingImpulse;
+                    SubmitWaterInteraction(event);
+
+                    // Ordinary rifle impacts use the ripple field by default. The optional
+                    // CPU droplet emitter is exposed in the dev Water tab for A/B inspection.
+                    const bool explosiveImpact = Type()->explosive;
+                    if (explosiveImpact || RifleWaterImpactSprayEnabled())
+                    {
+                        WaterSource waterSplash;
+                        waterSplash.SetSize(explosiveImpact ? 0.35f : 0.055f, explosiveImpact ? 0.65f : 0.10f);
+                        waterSplash.SetFades(0.08f, 0.03f, explosiveImpact ? 0.45f : 0.12f);
+                        waterSplash.SetTimes(0.08f, explosiveImpact ? 0.8f : 0.20f);
+
+                        const int numDroplets = explosiveImpact ? 24 : 2;
+                        for (int i = 0; i < numDroplets; ++i)
+                        {
+                            float angle =
+                                static_cast<float>(i) * (2.0f * 3.14159265f / static_cast<float>(numDroplets));
+                            float spreadSpeed = explosiveImpact ? 1.5f + GRandGen.RandomValue() * 2.5f
+                                                                : 0.15f + GRandGen.RandomValue() * 0.25f;
+                            float upSpeed = explosiveImpact ? 4.5f + GRandGen.RandomValue() * 5.5f
+                                                            : 0.55f + GRandGen.RandomValue() * 0.70f;
+                            Vector3 vel(std::cos(angle) * spreadSpeed, upSpeed, std::sin(angle) * spreadSpeed);
+                            Cloudlet* droplet = waterSplash.Drop(waterPoint, vel);
+                            if (droplet)
+                            {
+                                GLOB_WORLD->AddCloudlet(droplet);
+                            }
+                        }
+                    }
+                }
+            }
+
             if (t <= maxDist)
             {
                 position = isect;
 
-                if (IsLocal())
+                // A sea hit already submitted its water interaction above. Do not also
+                // run the legacy ground-impact presentation for ordinary rifle rounds:
+                // that path is the large visible "splash" the Water-tab switch controls.
+                const bool showLegacyWaterImpact = Type()->explosive || RifleWaterImpactSprayEnabled();
+                if (IsLocal() && (!_waterImpactDone || showLegacyWaterImpact))
                 {
                     Vector3 exploPos = position;
                     if (Type()->explosive)

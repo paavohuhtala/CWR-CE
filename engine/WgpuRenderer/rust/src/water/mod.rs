@@ -2,11 +2,48 @@ use wgpu::util::DeviceExt;
 
 use crate::ffi::{WgrWaterNode, WgrWaterParams};
 use crate::gfx3d::DEPTH_FORMAT;
+mod interaction;
+use interaction::Interaction;
+mod fft;
+pub use fft::FFT_RESOLUTION;
+use fft::Fft;
+mod foam;
+use crate::ffi::{WgrWaterInteractionEvent, WgrWaterInteractionParams};
+use foam::Foam;
 
 // Grid mesh resolution: GRID_N quads per axis, (GRID_N+1)^2 vertices, u16 indices.
-// Must match GRID_N in water.wgsl (and the terrain grid, so the two can eventually
-// share a mesh).
-const GRID_N: u32 = 32;
+// This deliberately exceeds the CDLOD leaf span used by WaterWgpu, because FFT waves
+// are geometric displacement: the original 32x32 mesh faceted crests into low-poly
+// pyramids even though the spectrum texture itself was smooth.
+//
+// MUST match GRID_N in water.wgsl. The vertex shader derives the CDLOD morph target
+// from it (grid_coarse = round(grid*GRID_N*0.5)*2/GRID_N); a mismatch morphs toward
+// the wrong lattice and cracks every LOD boundary.
+//
+// Why 96 and not 192 (measured 2026-07-28, Everon, 800x600):
+//   leafSize 200 m, ranges[0] 1600 m, ratio 2 -> a lod-L node is 200*2^L m wide and
+//   lives out to 1600*2^L m. Node size and distance double together, so EVERY LOD
+//   band bottoms out at the same projected quad size -- 0.39 px at 192. That is the
+//   reason a per-LOD index-buffer ladder buys nothing here: the bands are already
+//   equal in screen space, and striding the far ones would only make distant water
+//   coarser than near water.
+//   The real budget comes from the shader: compute_cascade_weights zeroes a cascade's
+//   geometry_weight below ~1.5-4 projected px, and cascades shorter than 20 m carry no
+//   displacement at all. At 192 the shortest surviving wavelength was sampled by ~10-19
+//   vertices; 96 still gives ~5-10, well above the ~4 needed for a smooth crest, and
+//   quarters the triangle count (186 nodes x 73,728 -> x 18,432).
+//   Sub-pixel triangles also shade a full 2x2 fragment quad each, so this cuts the
+//   water draw's fragment work as well as its vertex work.
+const GRID_N: u32 = 96;
+// Matches the GodotOceanWaves reference emitter.  These are procedural GPU instances
+// rather than CPU-owned particles: only crests that pass the FFT breaking test reach
+// the fragment stage, so the cost scales with visible whitewater rather than a CPU
+// particle list.
+// Matches the 128x128 world-anchored emitter in whitewater_render.wgsl. The old 45x45 field
+// covered a 10 m box around the camera, so breaking waves further out shed no spray at all.
+// Instances whose source is not breaking collapse to alpha 0 and are discarded in the fragment
+// stage, so the cost still scales with visible whitewater rather than with this count.
+const WHITEWATER_PARTICLE_COUNT: u32 = 16_384;
 
 // A flat GPU CDLOD water surface: the shared grid mesh instanced per selected node,
 // placed on a horizontal plane at the frame's sea level, drawn after opaque terrain +
@@ -22,9 +59,28 @@ pub struct Water {
     depth_view: wgpu::TextureView,
     env_view: wgpu::TextureView,
     env_sampler: wgpu::Sampler,
+    scene_view: wgpu::TextureView,
+    scene_sampler: wgpu::Sampler,
+    planar_view: wgpu::TextureView,
+    planar_sampler: wgpu::Sampler,
+    planar_params: wgpu::Buffer,
+    planar_gen: u64,
+    // Terrain heightmap + its world->texel mapping, for the vertex-stage seabed clamp.
+    heightmap_view: wgpu::TextureView,
+    conform_params: wgpu::Buffer,
+    heightmap_gen: u64,
+    interaction: Interaction,
+    fft: Option<Fft>,
+    fft_storage_supported: bool,
+    foam: Option<Foam>,
+    fft_fallback_view: wgpu::TextureView,
+    fft_sampler: wgpu::Sampler,
+    foam_fallback_view: wgpu::TextureView,
+    foam_sampler: wgpu::Sampler,
     // Generations the current group1_bind was built against (u64::MAX = still the dummy).
     depth_gen: u64,
     env_gen: u64,
+    scene_gen: u64,
     grid_vbuf: wgpu::Buffer,
     grid_ibuf: wgpu::Buffer,
     grid_index_count: u32,
@@ -32,9 +88,13 @@ pub struct Water {
     instance_cap: u64,
     instance_count: u32,
     pipeline: wgpu::RenderPipeline,
+    whitewater_pipeline: wgpu::RenderPipeline,
     // Set once wgr_water_set_params has run (i.e. a map is loaded); until then there
     // is nothing sensible to draw.
     have_params: bool,
+    // Retained for the scene-wide underwater compositor; the water UBO remains the
+    // sole source of sea level supplied by WaterWgpu.
+    last_params: Option<WgrWaterParams>,
 }
 
 impl Water {
@@ -45,6 +105,7 @@ impl Water {
         surface_format: wgpu::TextureFormat,
         sample_count: u32,
         composer: &mut naga_oil::compose::Composer,
+        fft_storage_supported: bool,
     ) -> Water {
         let group1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("wgr_water_group1_layout"),
@@ -57,6 +118,22 @@ impl Water {
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
                 // Opaque scene depth (prepass), single-sample: the 1x depth aspect or the MSAA
@@ -89,6 +166,132 @@ impl Water {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(80),
+                    },
+                    count: None,
+                },
+                // The terrain heightmap, sampled in the VERTEX stage so the displaced surface
+                // can be clamped to stay above the seabed. Without this the vertex shader has
+                // no idea where the ground is — `seabed_depth()` reconstructs it from the depth
+                // buffer, which only exists per fragment, far too late to move a vertex. A wave
+                // trough could therefore sink under a shallow beach, where the depth test
+                // (correctly) hid it and tore a moving hole in the shoreline.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Its world->texel mapping. WgrWaterParams already carries world_origin /
+                // terrain_grid / hm_width / hm_height, but those are filled independently by
+                // WaterWgpu; binding the terrain's own conform params next to the terrain's own
+                // texture means the sampling cannot silently disagree with the texture it reads.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 18,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                            crate::terrain::TerrainConformParams,
+                        >() as u64),
+                    },
                     count: None,
                 },
             ],
@@ -127,6 +330,23 @@ impl Water {
             foam_intensity: 1.0,
             swash_amp: 0.15,
             swash_speed: 0.15,
+            fft_control: [1.0, 1337.0, 12.0, 0.0],
+            fft_wind_sea: [0.82, 0.57, 11.0, 0.55],
+            fft_cascade_lengths: [48.0, 144.0, 432.0, 1296.0],
+            flow_direction_speed: [0.0, 0.0, 0.0, 0.0],
+            // x = debug view (0 = off), y = spray gate, z = spray activity, w = viewport
+            // height in pixels (1080 fallback; the C++ side pushes the real height each frame).
+            debug_params: [0.0, 0.0, 0.0, 1080.0],
+            // WTR-LOOK — x = energy model (1 = physical composite), y/z/w = glitter / SSS /
+            // reflection gains. The C++ side pushes the Water tab's values each frame.
+            look_params: [1.0, 1.0, 1.0, 1.0],
+            // WTR-LOOK — x = physical sea-state coupling on, y = residual spectrum amplitude
+            // (1.0 because the coupling carries the energy), z = low quality off, w = shore gain.
+            sea_params: [1.0, 1.0, 0.0, 1.0],
+            // Engage band, density, colour bias, caustic gain — the tuned defaults.
+            underwater_params: [1.5, 1.0, 1.0, 1.0],
+            // Off until the Water tab says otherwise, matching WaterSettings' default.
+            underwater_gate: [0.0, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&params_ubo, 0, bytemuck::bytes_of(&default_params));
 
@@ -173,7 +393,164 @@ impl Water {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
+        });
+        let scene_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("wgr_water_dummy_scene"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("wgr_water_scene_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // 1x1 stand-in heightmap so the bind is valid before a world loads. Its conform
+        // params default to enabled = 0, which makes the seabed clamp a no-op — open ocean
+        // with no terrain behaves exactly as before.
+        let heightmap_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("wgr_water_dummy_heightmap"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let conform_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgr_water_conform_params"),
+            size: std::mem::size_of::<crate::terrain::TerrainConformParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &conform_params,
+            0,
+            bytemuck::bytes_of(
+                &<crate::terrain::TerrainConformParams as bytemuck::Zeroable>::zeroed(),
+            ),
+        );
+        let planar_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("wgr_water_dummy_planar"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let planar_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("wgr_water_planar_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let planar_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wgr_water_planar_params"),
+            contents: bytemuck::cast_slice(&[0.0f32; 20]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let interaction = Interaction::new(device, composer);
+        let fft_fallback_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("wgr_water_fft_fallback"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 4,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+        let fft_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("wgr_water_fft_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let fft = Fft::new(
+            device,
+            queue,
+            &params_ubo,
+            fft_storage_supported,
+            FFT_RESOLUTION,
+        );
+        let foam_fallback_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("wgr_water_foam_fallback"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let foam_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("wgr_water_foam_material_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let foam = fft.as_ref().map(|fft| {
+            Foam::new(
+                device,
+                composer,
+                &params_ubo,
+                interaction.views(),
+                fft.displacement_view(),
+                fft.auxiliary_view(),
+                fft.cascade_config_buffer(),
+            )
         });
         let group1_bind = build_group1(
             device,
@@ -182,6 +559,24 @@ impl Water {
             &dummy_depth,
             &dummy_env,
             &env_sampler,
+            interaction.view(),
+            interaction.sampler(),
+            fft.as_ref()
+                .map_or(&fft_fallback_view, |f| f.displacement_view()),
+            fft.as_ref()
+                .map_or(&fft_fallback_view, |f| f.dynamics_view()),
+            fft.as_ref()
+                .map_or(&fft_fallback_view, |f| f.auxiliary_view()),
+            &fft_sampler,
+            foam.as_ref().map_or(&foam_fallback_view, |f| f.view()),
+            foam.as_ref().map_or(&foam_sampler, |f| f.sampler()),
+            &scene_view,
+            &scene_sampler,
+            &planar_view,
+            &planar_sampler,
+            &planar_params,
+            &heightmap_view,
+            &conform_params,
         );
 
         let (grid_vbuf, grid_ibuf, grid_index_count) = build_grid(device);
@@ -226,8 +621,10 @@ impl Water {
             immediate_size: 0,
         });
         let grid_attrs = wgpu::vertex_attr_array![0 => Float32x3];
-        let inst_attrs =
-            wgpu::vertex_attr_array![1 => Float32x2, 2 => Float32, 3 => Uint32, 4 => Float32x2];
+        let inst_attrs = wgpu::vertex_attr_array![
+            1 => Float32x2, 2 => Float32, 3 => Uint32, 4 => Float32x2,
+            5 => Float32x2, 6 => Float32
+        ];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("wgr_water_pipeline"),
             layout: Some(&pipeline_layout),
@@ -287,6 +684,60 @@ impl Water {
             cache: None,
         });
 
+        // GodotOceanWaves renders sea spray as camera-facing quads emitted at FFT foam
+        // crests.  Keep it in its own pipeline so the transparent ocean mesh remains
+        // independent of the considerably sparser whitewater instances.
+        let whitewater_shader = crate::shaders::make_module(
+            device,
+            composer,
+            "wgr_whitewater_render_shader",
+            include_str!("whitewater_render.wgsl"),
+            "water/whitewater_render.wgsl",
+        );
+        let whitewater_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("wgr_water_whitewater_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &whitewater_shader,
+                entry_point: Some("vs_whitewater"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            // Spray belongs above the surface but must still be hidden by terrain,
+            // hulls, and other opaque scene geometry.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &whitewater_shader,
+                entry_point: Some("fs_whitewater"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &fs_constants,
+                    ..Default::default()
+                },
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Water {
             params_ubo,
             group1_layout,
@@ -294,8 +745,26 @@ impl Water {
             depth_view: dummy_depth,
             env_view: dummy_env,
             env_sampler,
+            scene_view,
+            scene_sampler,
+            planar_view,
+            planar_sampler,
+            planar_params,
+            planar_gen: u64::MAX,
+            heightmap_view,
+            conform_params,
+            heightmap_gen: u64::MAX,
+            interaction,
+            fft,
+            fft_storage_supported,
+            foam,
+            fft_fallback_view,
+            fft_sampler,
+            foam_fallback_view,
+            foam_sampler,
             depth_gen: u64::MAX,
             env_gen: u64::MAX,
+            scene_gen: u64::MAX,
             grid_vbuf,
             grid_ibuf,
             grid_index_count,
@@ -303,14 +772,21 @@ impl Water {
             instance_cap,
             instance_count: 0,
             pipeline,
+            whitewater_pipeline,
             have_params: false,
+            last_params: None,
         }
     }
 
     // Point group1 at the scene depth (opaque prepass) for the depth-based colour + soft
     // shoreline. Rebuilds the bind group only when the view was recreated (resize), tracked by
     // `gen` from Gfx3d::depth_gen(); a no-op otherwise. Called each frame before the water pass.
-    pub fn set_depth_view(&mut self, device: &wgpu::Device, depth: &wgpu::TextureView, view_gen: u64) {
+    pub fn set_depth_view(
+        &mut self,
+        device: &wgpu::Device,
+        depth: &wgpu::TextureView,
+        view_gen: u64,
+    ) {
         if self.depth_gen == view_gen {
             return;
         }
@@ -338,20 +814,309 @@ impl Water {
             &self.depth_view,
             &self.env_view,
             &self.env_sampler,
+            self.interaction.view(),
+            self.interaction.sampler(),
+            self.fft
+                .as_ref()
+                .map_or(&self.fft_fallback_view, |f| f.displacement_view()),
+            self.fft
+                .as_ref()
+                .map_or(&self.fft_fallback_view, |f| f.dynamics_view()),
+            self.fft
+                .as_ref()
+                .map_or(&self.fft_fallback_view, |f| f.auxiliary_view()),
+            &self.fft_sampler,
+            self.foam
+                .as_ref()
+                .map_or(&self.foam_fallback_view, |f| f.view()),
+            self.foam
+                .as_ref()
+                .map_or(&self.foam_sampler, |f| f.sampler()),
+            &self.scene_view,
+            &self.scene_sampler,
+            &self.planar_view,
+            &self.planar_sampler,
+            &self.planar_params,
+            &self.heightmap_view,
+            &self.conform_params,
         );
     }
 
-    pub fn set_params(&mut self, queue: &wgpu::Queue, params: WgrWaterParams) {
+    pub fn set_params(&mut self, queue: &wgpu::Queue, mut params: WgrWaterParams) {
+        // A device lacking float storage textures keeps the established Gerstner carrier.
+        if self.fft.is_none() {
+            params.fft_control[0] = 0.0;
+        }
         queue.write_buffer(&self.params_ubo, 0, bytemuck::bytes_of(&params));
+        if let Some(fft) = &mut self.fft {
+            fft.set_params(&params);
+        }
         self.have_params = true;
+        self.last_params = Some(params);
     }
 
-    pub fn prepare(
+    pub fn set_cascade_config(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        nodes: &[WgrWaterNode],
+        index: u32,
+        config: crate::ffi::WgrWaterCascadeConfig,
     ) {
+        // Resolution is a real live quality control, not informational metadata.
+        // Rebuild only when an enabled preset supplies one of the supported tiers;
+        // disabled tail cascades use resolution=0 and must not switch us back.
+        let requested = config.resolution;
+        let valid_resolution = matches!(
+            requested,
+            fft::FFT_MIN_RESOLUTION | FFT_RESOLUTION | fft::FFT_MAX_RESOLUTION
+        );
+        let needs_rebuild = valid_resolution
+            && self
+                .fft
+                .as_ref()
+                .is_none_or(|current| current.resolution() != requested);
+        if needs_rebuild && self.fft_storage_supported {
+            self.fft = Fft::new(
+                device,
+                queue,
+                &self.params_ubo,
+                self.fft_storage_supported,
+                requested,
+            );
+            if let (Some(fft), Some(params)) = (&mut self.fft, self.last_params.as_ref()) {
+                fft.set_params(params);
+            }
+            self.rebuild_group1(device);
+        }
+        if let Some(fft) = &mut self.fft {
+            fft.set_cascade_config(device, queue, index, config);
+        }
+    }
+
+    /// `(sea_level, time, eye submersion depth in metres)`. The depth lane is
+    /// positive when the eye is under the local (wave-displaced) surface and zero
+    /// when it is dry, so callers can ramp with it instead of switching on a flag.
+    pub fn underwater_params(&self) -> Option<(f32, f32, f32)> {
+        self.last_params
+            .map(|p| (p.sea_level, p.time, p.fft_control[3].max(0.0)))
+    }
+
+    /// True when the live Water-tab performance mode has disabled reflection work.
+    /// This is queried before frame encoding so the renderer can avoid creating the
+    /// reflected camera and recording a planar pass the water shader cannot sample.
+    pub fn low_quality(&self) -> bool {
+        self.last_params
+            .map(|p| p.sea_params[2] > 0.5)
+            .unwrap_or(false)
+    }
+
+    /// The water's own body colour and extinction, so the underwater compositor can fog the scene
+    /// in the SAME colour the surface is tinted with. It previously used a hardcoded cyan haze,
+    /// which is why submerging looked like a different substance from the water you swam into.
+    /// Returns (shallow rgb, deep rgb, color_ext), with both colours in gamma space.
+    pub fn underwater_body(&self) -> Option<([f32; 3], [f32; 3], f32)> {
+        self.last_params.map(|p| {
+            (
+                [p.shallow_color[0], p.shallow_color[1], p.shallow_color[2]],
+                [p.deep_color[0], p.deep_color[1], p.deep_color[2]],
+                p.color_ext,
+            )
+        })
+    }
+
+    /// FFT fields consumed by the underwater caustic compute pass. The fallback array
+    /// is a valid zero texture, so the compositor remains operational on Gerstner-only
+    /// adapters without a second binding path.
+    pub fn underwater_fft_views(&self) -> (wgpu::TextureView, wgpu::TextureView) {
+        (
+            self.fft
+                .as_ref()
+                .map_or(&self.fft_fallback_view, |f| f.dynamics_view())
+                .clone(),
+            self.fft
+                .as_ref()
+                .map_or(&self.fft_fallback_view, |f| f.auxiliary_view())
+                .clone(),
+        )
+    }
+
+    /// Whether the Water tab's "Underwater effect" checkbox is on. The compositor must not
+    /// run at all when it is off — the submersion depth alone cannot express this, because
+    /// the compositor also engages on proximity to the surface and a submerged camera is
+    /// always proximate.
+    pub fn underwater_enabled(&self) -> bool {
+        self.last_params.is_some_and(|p| p.underwater_gate[0] > 0.5)
+    }
+
+    /// Live underwater tuning from the Water tab: `(engage band m, density, colour bias,
+    /// caustic gain)`. The defaults reproduce the tuned look, so a renderer that never
+    /// receives water params behaves as it did before these became adjustable.
+    pub fn underwater_tuning(&self) -> (f32, f32, f32, f32) {
+        self.last_params
+            .map(|p| {
+                (
+                    p.underwater_params[0],
+                    p.underwater_params[1],
+                    p.underwater_params[2],
+                    p.underwater_params[3],
+                )
+            })
+            .unwrap_or((1.5, 1.0, 1.0, 1.0))
+    }
+
+    /// Vertical FFT displacement, so the underwater compositor can find the wavy
+    /// surface instead of assuming a flat plane at `sea_level`. Same fallback as
+    /// `underwater_fft_views`: a valid zero array on Gerstner-only adapters, which
+    /// degrades the compositor to the flat-plane behaviour rather than breaking it.
+    pub fn underwater_displacement_view(&self) -> wgpu::TextureView {
+        self.fft
+            .as_ref()
+            .map_or(&self.fft_fallback_view, |f| f.displacement_view())
+            .clone()
+    }
+
+    /// Spectrum controls needed to map the camera-centred caustic field to the same
+    /// aperiodic world coordinates as the visible water surface. `wave_scale` is the
+    /// Water-tab lookup dilation; the compositor needs it for the same reason the
+    /// surface shader does, or its idea of the waterline drifts from the drawn waves.
+    pub fn underwater_spectrum(&self) -> ([f32; 4], u32, f32, f32, f32, f32) {
+        self.last_params
+            .map(|p| {
+                (
+                    p.fft_cascade_lengths,
+                    self.fft.as_ref().map_or(0, |f| f.active_layers()),
+                    p.warp_amp,
+                    p.sea_level,
+                    p.debug_params[0],
+                    p.wave_scale,
+                )
+            })
+            .unwrap_or(([1.0; 4], 0, 0.0, 0.0, 0.0, 1.0))
+    }
+
+    pub fn fft_enabled(&self) -> bool {
+        self.fft.is_some()
+    }
+
+    pub fn set_interaction_params(
+        &mut self,
+        queue: &wgpu::Queue,
+        params: WgrWaterInteractionParams,
+    ) {
+        self.interaction.set_params(queue, params);
+        if let Some(foam) = &self.foam {
+            foam.set_params(queue, params);
+        }
+    }
+
+    pub fn submit_interactions(
+        &mut self,
+        queue: &wgpu::Queue,
+        events: &[WgrWaterInteractionEvent],
+    ) {
+        self.interaction.submit(queue, events);
+    }
+
+    pub fn update_interactions(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        timers: &crate::gpu_timers::GpuTimers,
+    ) {
+        use crate::gpu_timers::Region;
+        // WTR-001 — deterministic water freeze. The dev-only `Engine::WaterSettings::Freeze`
+        // block is packed by WaterWgpu into WgrWaterParams.fft_control.z as a WGR_WATER_FREEZE_*
+        // bit mask. Skipping the dispatch entirely (rather than running it against time=const and
+        // dt=0) keeps the captured frame truly frozen without the GPU cost; the choice is a perf
+        // optimization on top of `freezeTime`, not a correctness lever — set_params already
+        // substitutes the right UBO values, so the masked-out passes would be no-ops anyway.
+        const FREEZE_FFT: u32 = 1 << 0;
+        const FREEZE_INTERACTION: u32 = 1 << 1;
+        const FREEZE_FOAM: u32 = 1 << 2;
+        let freeze_mask: u32 = self
+            .last_params
+            .map(|p| p.fft_control[2].to_bits())
+            .unwrap_or(0);
+        if (freeze_mask & FREEZE_FFT) == 0 {
+            if let Some(fft) = &mut self.fft {
+                fft.dispatch(encoder, timers);
+            }
+        }
+        if (freeze_mask & FREEZE_INTERACTION) == 0 {
+            // WTR-002 — injection + propagation are one fused kernel today, so a single
+            // bracket covers both spec rows (the split lands with the interaction rework).
+            timers.begin(encoder, Region::Interaction);
+            self.interaction.dispatch(encoder);
+            timers.end(encoder, Region::Interaction);
+        }
+        if (freeze_mask & FREEZE_FOAM) == 0 {
+            if let Some(foam) = &mut self.foam {
+                timers.begin(encoder, Region::Foam);
+                foam.dispatch(encoder, self.interaction.current());
+                timers.end(encoder, Region::Foam);
+            }
+        }
+        self.rebuild_group1(device);
+    }
+
+    // The snapshot is a distinct completed scene texture, never water's active target.
+    pub fn set_scene_view(
+        &mut self,
+        device: &wgpu::Device,
+        scene: &wgpu::TextureView,
+        view_gen: u64,
+    ) {
+        if self.scene_gen == view_gen {
+            return;
+        }
+        self.scene_view = scene.clone();
+        self.scene_gen = view_gen;
+        self.rebuild_group1(device);
+    }
+
+    // A separate completed reflected-camera target. Validity is explicit because black
+    // reflected pixels are legitimate at night and must not be confused with a dummy.
+    pub fn set_planar_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        planar: &wgpu::TextureView,
+        view_gen: u64,
+        full_vp: [f32; 16],
+        valid: bool,
+    ) {
+        let mut params = [0.0f32; 20];
+        params[..16].copy_from_slice(&full_vp);
+        params[16] = if valid { 1.0 } else { 0.0 };
+        queue.write_buffer(&self.planar_params, 0, bytemuck::cast_slice(&params));
+        if self.planar_gen != view_gen {
+            self.planar_view = planar.clone();
+            self.planar_gen = view_gen;
+            self.rebuild_group1(device);
+        }
+    }
+
+    // Lend the terrain heightmap to the water vertex stage so the surface can be clamped
+    // above the seabed. The params are small and change with the world, so they are written
+    // every call; the bind group is only rebuilt when the texture itself was reallocated.
+    pub fn set_heightmap(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        heightmap: &wgpu::TextureView,
+        view_gen: u64,
+        params: &crate::terrain::TerrainConformParams,
+    ) {
+        queue.write_buffer(&self.conform_params, 0, bytemuck::bytes_of(params));
+        if self.heightmap_gen == view_gen {
+            return;
+        }
+        self.heightmap_view = heightmap.clone();
+        self.heightmap_gen = view_gen;
+        self.rebuild_group1(device);
+    }
+
+    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, nodes: &[WgrWaterNode]) {
         self.instance_count = nodes.len() as u32;
         if nodes.is_empty() {
             return;
@@ -397,10 +1162,31 @@ impl Water {
             0,
             first_node..first_node + node_count,
         );
+
+        // The reference demo keeps one sea-spray emitter under its ocean object.
+        // WaterWgpu normally submits one batch, but guard this draw so split CDLOD
+        // batches do not duplicate the same camera-centred emitter.
+        //
+        // Only submit it when spray is actually enabled. The shader collapses disabled particles to
+        // alpha 0, but that only saves the FRAGMENT cost — the vertex stage still runs for every
+        // candidate, hashing, sampling four FFT cascades and the interaction field per instance.
+        // At 16,384 candidates that is ~98k vertices of real work every frame with the feature
+        // switched off. (An earlier comment here claimed the cost scales with visible whitewater;
+        // that was only ever true of the fragment stage.)
+        let spray_enabled = self
+            .last_params
+            .map(|p| p.debug_params[1] > 0.5 && p.sea_params[2] < 0.5)
+            .unwrap_or(false);
+        if first_node == 0 && spray_enabled {
+            pass.set_pipeline(&self.whitewater_pipeline);
+            pass.set_bind_group(0, camera_bind, &[camera_offset]);
+            pass.set_bind_group(1, &self.group1_bind, &[]);
+            pass.draw(0..6, 0..WHITEWATER_PARTICLE_COUNT);
+        }
     }
 }
 
-// group1 = { water params UBO (0), opaque scene depth (1), sky env map (2), env sampler (3) }.
+// group1 = params/depth/env/interaction, shared four-layer FFT fields (6..9), and foam history.
 // Rebuilt whenever the depth or env view changes; the params UBO + sampler are stable so they ride
 // along.
 fn build_group1(
@@ -410,6 +1196,21 @@ fn build_group1(
     depth: &wgpu::TextureView,
     env: &wgpu::TextureView,
     env_sampler: &wgpu::Sampler,
+    interaction: &wgpu::TextureView,
+    interaction_sampler: &wgpu::Sampler,
+    displacement: &wgpu::TextureView,
+    dynamics: &wgpu::TextureView,
+    auxiliary: &wgpu::TextureView,
+    fft_sampler: &wgpu::Sampler,
+    foam: &wgpu::TextureView,
+    foam_sampler: &wgpu::Sampler,
+    scene: &wgpu::TextureView,
+    scene_sampler: &wgpu::Sampler,
+    planar: &wgpu::TextureView,
+    planar_sampler: &wgpu::Sampler,
+    planar_params: &wgpu::Buffer,
+    heightmap: &wgpu::TextureView,
+    conform_params: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("wgr_water_group1_bind"),
@@ -430,6 +1231,66 @@ fn build_group1(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(env_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(interaction),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(interaction_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(displacement),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(dynamics),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(auxiliary),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::Sampler(fft_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(foam),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::Sampler(foam_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(scene),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::Sampler(scene_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: wgpu::BindingResource::TextureView(planar),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: wgpu::BindingResource::Sampler(planar_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: planar_params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(heightmap),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: conform_params.as_entire_binding(),
             },
         ],
     })
@@ -499,4 +1360,192 @@ fn build_grid(device: &wgpu::Device) -> (wgpu::Buffer, wgpu::Buffer, u32) {
         usage: wgpu::BufferUsages::INDEX,
     });
     (vbuf, ibuf, indices.len() as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shoreline_geometry_uses_world_continuous_height_field_inputs() {
+        let shader = include_str!("water.wgsl");
+        assert!(shader.contains("let has_seabed = seabed_contains(base_xz)"));
+        assert!(shader.contains("vertex_shore_factor = 1.0 - smoothstep(2.0, 30.0, local_depth)"));
+        assert!(shader.contains("fft_geometry_disp(base_xz, dist, vertex_shore_factor)"));
+        assert!(!shader.contains("fft_geometry_disp(base_xz, dist, shore_factor)"));
+        assert!(shader.contains("disp.x * horizontal_keep"));
+    }
+
+    #[test]
+    fn ggx_water_lobe_is_finite_and_broadens_with_slope_variance() {
+        let roughness = |variance: f32, micro_slope: f32| {
+            let legacy_floor = (2.0_f32 / 242.0).sqrt();
+            (legacy_floor + variance.clamp(0.0, 0.25).sqrt() * 0.26 + micro_slope * 0.35)
+                .clamp(0.075, 0.32)
+        };
+        let ggx = |roughness: f32| {
+            let alpha_sq = roughness.powi(4);
+            let d_base = (1.0_f32 * (alpha_sq - 1.0) + 1.0).max(1e-6);
+            alpha_sq / (std::f32::consts::PI * d_base * d_base)
+        };
+
+        let calm = roughness(0.0, 0.0);
+        let rough = roughness(0.20, 0.04);
+        assert!((0.075..=0.32).contains(&calm));
+        assert!((0.075..=0.32).contains(&rough));
+        assert!(rough > calm);
+        assert!(ggx(calm).is_finite() && ggx(rough).is_finite());
+        assert!(ggx(rough) < ggx(calm));
+    }
+
+    #[test]
+    fn foam_material_is_rough_diffuse_with_subdued_dielectric_specular() {
+        let ggx = |roughness: f32, ndh: f32| {
+            let alpha_sq = roughness.powi(4);
+            let base = (ndh * ndh * (alpha_sq - 1.0) + 1.0).max(1e-6);
+            alpha_sq / (std::f32::consts::PI * base * base)
+        };
+        let foam_roughness = 0.72;
+        let foam_f0 = 0.02;
+        let diffuse = 0.94 / std::f32::consts::PI;
+        let specular = ggx(foam_roughness, 1.0) * foam_f0 * 0.08;
+
+        assert!(foam_roughness > 0.5);
+        assert!(specular.is_finite() && diffuse.is_finite());
+        assert!(specular < diffuse * 0.1);
+        assert!(ggx(foam_roughness, 0.7) > ggx(foam_roughness, 0.2));
+    }
+
+    #[test]
+    fn planar_reflection_uses_stable_plane_projection_with_bounded_ssr_overlap() {
+        let shader = include_str!("water.wgsl");
+        assert!(shader.contains("fn planar_project"));
+        assert!(
+            shader.contains("let plane_point = vec3<f32>(absolute.x, wp.sea_level, absolute.z)")
+        );
+        assert!(!shader.contains("2.0 * wp.sea_level - absolute.y"));
+        assert!(shader.contains("let distorted_uv = clamp(uv, texel, vec2<f32>(1.0) - texel)"));
+        assert!(!shader.contains("let slope_projection = planar_project"));
+        assert!(shader.contains("let max_mip = f32(textureNumLevels(planar_color) - 1u)"));
+        assert!(
+            shader.contains("let reflection_lod = (0.14 + 0.86 * roughness * roughness) * max_mip")
+        );
+        assert!(shader.contains("planar_refl.a * 0.68 * (1.0 - ssr.a * 0.80)"));
+        assert!(shader.contains(
+            "let ssr_distance_weight = 1.0 - smoothstep(180.0, 320.0, length(in.world_pos))"
+        ));
+        assert!(shader.contains("if (ssr_distance_weight > 0.002)"));
+
+        let texel = 1.0 / 960.0_f32; // a representative half-res 1920px target
+        let roughness = 0.20_f32;
+        let max_warp = texel * (5.0 + roughness * 5.0);
+        let projected_slope = 0.040_f32;
+        let bounded = projected_slope.clamp(-max_warp, max_warp);
+        assert!(bounded.is_finite());
+        assert!(bounded > 5.0 * texel);
+        assert!(bounded <= 10.0 * texel);
+
+        let planar_weight = 1.0 - 1.0 * 0.80;
+        assert!(planar_weight > 0.0 && planar_weight < 1.0);
+    }
+
+    #[test]
+    fn procedural_water_detail_skips_zero_contribution_work() {
+        let shader = include_str!("water.wgsl");
+        assert!(shader.contains("if (strength <= 1e-5)"));
+        assert!(shader.contains("if (foam_band > 0.001 && wp.foam_intensity > 0.001)"));
+        assert!(shader.contains("let foam_history_sample = state.foam_history_sample"));
+        assert!(shader.contains("if (crest_top > 0.001)"));
+        assert!(shader.contains("if (unstructured_foam > 0.001)"));
+        assert!(shader.contains("if (raw_length > 0.0)"));
+        assert!(!shader.contains("lost_variance = lost_variance"));
+    }
+
+    #[test]
+    fn sunlight_catch_uses_the_godot_ocean_waves_light_model() {
+        let shader = include_str!("water.wgsl");
+        assert!(shader.contains("fn godot_smith_masking_shadowing"));
+        assert!(shader.contains("fn godot_ggx_distribution"));
+        assert!(shader.contains("fn godot_water_fresnel"));
+        assert!(shader.contains("const GODOT_LIGHT_ROUGHNESS: f32 = 0.4"));
+        assert!(shader.contains("let wave_height = state.displacement.y"));
+        assert!(shader.contains("let sss_near = 0.5 * pow(godot_nv, 2.0)"));
+    }
+
+    // WTR-001 — the deterministic-freeze mask is bit-cast into WgrWaterParams.fft_control[2].
+    // The legacy authored default (12.0 m minimum geometry wavelength) is preserved when no
+    // freeze is requested: its bit pattern's low three bits are clean so it cannot accidentally
+    // match a freeze bit, but encoding any non-zero mask rewrites the lane as the bit-cast u32.
+    // This test locks both halves of the contract (legacy-safe + mask-decodable).
+    #[test]
+    fn freeze_mask_decodes_from_fft_control_z_without_breaking_legacy_default() {
+        use bytemuck::Zeroable;
+        const FREEZE_FFT: u32 = 1 << 0;
+        const FREEZE_INTERACTION: u32 = 1 << 1;
+        const FREEZE_FOAM: u32 = 1 << 2;
+
+        // The legacy authored default is no freeze: 12.0f, whose IEEE-754 bits have low 3 bits
+        // all zero (verified here so a re-encoded mask never collides with it via coincidence).
+        let legacy_default = 12.0f32;
+        assert_eq!(
+            legacy_default.to_bits() & (FREEZE_FFT | FREEZE_INTERACTION | FREEZE_FOAM),
+            0
+        );
+
+        // Encoding the all-freeze mask via the same std::mem::transmute-style path WaterWgpu uses
+        // (bit-cast of the u32 mask to f32) yields a float whose .to_bits() returns the mask, so
+        // Water::update_interactions round-trips the bits faithfully.
+        let mut params = crate::ffi::WgrWaterParams::zeroed();
+        params.fft_control[2] = f32::from_bits(FREEZE_FFT | FREEZE_INTERACTION | FREEZE_FOAM);
+        let decoded = params.fft_control[2].to_bits();
+        assert_eq!(decoded & FREEZE_FFT, FREEZE_FFT);
+        assert_eq!(decoded & FREEZE_INTERACTION, FREEZE_INTERACTION);
+        assert_eq!(decoded & FREEZE_FOAM, FREEZE_FOAM);
+
+        // A masked-out (skipped) dispatch reads as the bit being ON; a normal frame reads as OFF.
+        let normal = 0u32;
+        assert_eq!(normal & FREEZE_FFT, 0);
+        assert_eq!(normal & FREEZE_INTERACTION, 0);
+        assert_eq!(normal & FREEZE_FOAM, 0);
+    }
+
+    // WTR-003 / WTR-LOOK — the debug-view selector rides WgrWaterParams.debug_params.x and the
+    // surface energy model rides look_params.x, both appended at the struct end so every existing
+    // lane keeps its offset. Lock the field offsets (192, 208) and the total size (224) so a
+    // reorder on either side of the FFI boundary fails here, not as a silent UBO misread in the
+    // shader. underwater_params (the Water tab's live underwater tuning) is the newest tail
+    // lane and is locked the same way.
+    #[test]
+    fn debug_params_appended_without_shifting_existing_lanes() {
+        use crate::ffi::WgrWaterParams;
+        assert_eq!(std::mem::size_of::<WgrWaterParams>(), 272);
+        assert_eq!(
+            std::mem::offset_of!(WgrWaterParams, debug_params),
+            192,
+            "debug_params must sit at the struct end so earlier lanes keep their offsets"
+        );
+        assert_eq!(
+            std::mem::offset_of!(WgrWaterParams, look_params),
+            208,
+            "look_params must be appended after debug_params, not inserted before it"
+        );
+        assert_eq!(
+            std::mem::offset_of!(WgrWaterParams, sea_params),
+            224,
+            "sea_params must be appended after look_params, not inserted before it"
+        );
+        assert_eq!(
+            std::mem::offset_of!(WgrWaterParams, underwater_params),
+            240,
+            "underwater_params must be appended after sea_params, not inserted before it"
+        );
+        assert_eq!(
+            std::mem::offset_of!(WgrWaterParams, underwater_gate),
+            256,
+            "underwater_gate must be appended after underwater_params, not inserted before it"
+        );
+        // flow_direction_speed (the previous last field) must not have moved.
+        assert_eq!(
+            std::mem::offset_of!(WgrWaterParams, flow_direction_speed),
+            176
+        );
+    }
 }

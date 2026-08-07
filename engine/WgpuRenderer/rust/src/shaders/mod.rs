@@ -34,6 +34,10 @@ pub fn build_composer() -> Composer {
     let mut composer = Composer::default().with_capabilities(capabilities);
     for (source, file_path) in [
         (include_str!("color.wgsl"), "color.wgsl"),
+        (
+            include_str!("../water/fft_sampling.wgsl"),
+            "water/fft_sampling.wgsl",
+        ),
         (include_str!("gbuffer.wgsl"), "gbuffer.wgsl"),
         (include_str!("frame.wgsl"), "frame.wgsl"),
         (include_str!("skin.wgsl"), "skin.wgsl"),
@@ -140,6 +144,29 @@ mod tests {
             include_str!("../terrain/terrain_shadow.wgsl"),
             "terrain/terrain_shadow.wgsl",
         );
+        compose(include_str!("../grass/grass.wgsl"), "grass/grass.wgsl");
         compose(include_str!("../water/water.wgsl"), "water/water.wgsl");
+        compose(
+            include_str!("../water/whitewater_render.wgsl"),
+            "water/whitewater_render.wgsl",
+        );
+        compose(
+            include_str!("../water/interaction.wgsl"),
+            "water/interaction.wgsl",
+        );
+        compose(include_str!("../water/foam.wgsl"), "water/foam.wgsl");
+        compose(
+            include_str!("../water/fft_spectrum.wgsl"),
+            "water/fft_spectrum.wgsl",
+        );
+        compose(include_str!("../water/fft_row.wgsl"), "water/fft_row.wgsl");
+        compose(
+            include_str!("../water/fft_compose.wgsl"),
+            "water/fft_compose.wgsl",
+        );
+        compose(
+            include_str!("../water/whitewater.wgsl"),
+            "water/whitewater.wgsl",
+        );
     }
 }

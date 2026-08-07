@@ -327,6 +327,9 @@ public:
     /// Screenshot output path (empty = no screenshot)
     const std::string& GetScreenshotPath() const { return _screenshotPath; }
 
+    /// Optional JSON sidecar written with renderer timings for a capture.
+    const std::string& GetCaptureMetricsPath() const { return _captureMetricsPath; }
+
     /// CLI view distance override (--vd N, 0 = use config file value)
     float GetViewDistanceOverride() const { return _viewDistanceOverride; }
     
@@ -349,7 +352,11 @@ private:
     bool _noSplash = false;
     bool _noBanner = false;
     bool _noMenuScene = false;
-    std::string _renderBackend = "gl33";
+    // WGPU is the default backend. GL33 remains fully supported and is one flag away
+    // (--render gl33); it is the fallback, not the target. Nothing here silently falls
+    // back -- selecting a backend that fails to start is a failure, which is the whole
+    // point of CORE-NEG-001's no-silent-fallback check.
+    std::string _renderBackend = "wgpu";
     bool _enablePIII = false;
     bool _enableHWTL = false;
     bool _disableHWTL = false;
@@ -418,6 +425,8 @@ private:
     float _confirmRevertTimeoutSeconds = 0.f; // 0 → engine default (15s)
     float _appTimeoutSeconds = 0.f;
     std::string _testMissionPath;
+    /// --dev-map NAME: scratch map to boot, resolved against ./dev-missions/.
+    std::string _devMapName;
     std::string _testType = "autotest";
     std::string _simulateMissionPath;
     bool _simulateMode = false;
@@ -453,6 +462,7 @@ private:
 
     // Screenshot output (shared between --viewer and --test-mission screenshot)
     std::string _screenshotPath;
+    std::string _captureMetricsPath;
 
     // Working directory
     std::string _workingDirectory;  // Game data directory (empty = current directory)

@@ -16,7 +16,14 @@ extern void SDLInput_GamepadRemoved(SDL_JoystickID which);
 extern void SDLInput_BufferUIKeyEvent(SDL_Keycode key, bool down);
 extern void SDLInput_BufferUICharEvent(const char* text);
 #include <Poseidon/Foundation/Framework/AppFrame.hpp>
-extern void SetSkipKeys(bool skip);
+// Arm the input settle window. GInput.gameFocusLost is consulted in eight places
+// across the input system (MouseState::Update, the InputSubsystem QueryKey/QueryAxis
+// guards, the gamepad look path) and was never written by anything — the whole
+// focus-suppression design was inert. It gates AIM deltas only; menu cursor movement
+// and clicks still pass, which is what makes it safe to arm on the way back in.
+// Declared like the SDLInput_* buffers above so this header keeps its no-input-header
+// dependency; the counter itself lives with GInput in InputProcessingSdl.cpp.
+extern void SDLInput_NoteFocusChange();
 
 // SDL event-pump helper used by EngineGL33.  Does NOT own the SDL_Window —
 // the renderer manages its lifecycle.  Handles SDL event polling, focus
@@ -117,10 +124,23 @@ class SDLEventWindow
                 if (_sdlWindow)
                     SDL_GetWindowSizeInPixels(_sdlWindow, &_width, &_height);
                 _resized = true;
+                LOG_DEBUG(Graphics, "SDLEventWindow: window resized to {}x{}; reconfiguring renderer surface", _width,
+                          _height);
                 // Notify the engine so it can resize the swap chain with the
                 // correct final dimensions (critical for D3D11 FLIP_DISCARD).
                 if (::Poseidon::GEngine)
                     ::Poseidon::GEngine->OnWindowResized(_width, _height);
+            }
+            else if (event.type == SDL_EVENT_WINDOW_MINIMIZED)
+            {
+                // A minimized WGPU surface is expected to acquire as Occluded.  Keep
+                // the event observable in runtime logs so lifecycle smoke runs prove
+                // that the application consumed the real OS transition.
+                LOG_DEBUG(Graphics, "SDLEventWindow: window minimized; renderer will skip occluded frames");
+            }
+            else if (event.type == SDL_EVENT_WINDOW_RESTORED)
+            {
+                LOG_DEBUG(Graphics, "SDLEventWindow: window restored; renderer may resume presentation");
             }
             else if (event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN)
             {
@@ -139,11 +159,24 @@ class SDLEventWindow
                 _focused = true;
                 _focusGained = true;
                 GApp->m_appActive = true;
+                // Re-arm the settle window. Coming back from another application the
+                // first motion events can carry the accumulated delta from wherever the
+                // pointer went while away; without this they land as a view whip.
+                SDLInput_NoteFocusChange();
+                // Reported 2026-08-03: after alt-tabbing back, in-game input works but
+                // the in-mission menu (Abort / Exit) stops responding to clicks. Two
+                // rounds of static tracing did not settle it, so make the machine say
+                // what its state is at the moment focus returns. Every field here is a
+                // candidate cause, and one line rules most of them out at a glance.
+                LOG_INFO(Input,
+                         "focus gained: appActive={} appPaused={} appIconic={} mouseGrab={} "
+                         "sdlRelative={} keepFocus={}",
+                         GApp->m_appActive, GApp->m_appPaused, GApp->m_appIconic, _mouseGrab,
+                         _sdlWindow ? SDL_GetWindowRelativeMouseMode(_sdlWindow) : false, GApp->m_keepFocus);
                 if (_mouseGrab && _sdlWindow)
                     SDL_SetWindowRelativeMouseMode(_sdlWindow, true);
                 if (::Poseidon::GEngine)
                     ::Poseidon::GEngine->Activate();
-                SetSkipKeys(true);
                 if (Poseidon::GSoundsys)
                     Poseidon::GSoundsys->Activate(true);
             }
@@ -152,13 +185,14 @@ class SDLEventWindow
                 _focused = false;
                 _focusLost = true;
                 GApp->m_appActive = false;
+                SDLInput_NoteFocusChange();
+                LOG_INFO(Input, "focus lost: mouseGrab={} keepFocus={}", _mouseGrab, GApp->m_keepFocus);
                 if (_sdlWindow)
                     SDL_SetWindowRelativeMouseMode(_sdlWindow, false);
                 if (!GApp->m_keepFocus)
                 {
                     if (::Poseidon::GEngine)
                         ::Poseidon::GEngine->Deactivate();
-                    SetSkipKeys(true);
                     if (Poseidon::GSoundsys)
                         Poseidon::GSoundsys->Activate(false);
                 }

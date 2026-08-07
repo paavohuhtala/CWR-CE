@@ -1,6 +1,8 @@
 #include <Poseidon/World/Entities/Infantry/SoldierOldCommon.hpp>
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Input/InputSubsystem.hpp>
+#include <Poseidon/Graphics/Rendering/WaterInteractionBridge.hpp>
+#include <Poseidon/World/Terrain/WaterSurfaceQuery.hpp>
 #include <Poseidon/Network/NetworkCustomAssets.hpp>
 #include <limits.h>
 #include <stdio.h>
@@ -302,6 +304,7 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
     if (!CheckPredictionFrozen())
     {
         Vector3 position = Position();
+        const bool playerControlled = Brain() && Brain()->IsPlayer();
 
         // simulate interaction with land
         Vector3 friction(VZero), torqueFriction(VZero);
@@ -334,6 +337,49 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             pForce[0] = 0;
             pForce[1] = -G_CONST * GetMass();
             pForce[2] = 0;
+            if (playerControlled && _waterBuoyancyContact)
+            {
+                const float waveTime = Glob.time.toFloat();
+                const float seaLevel = GLOB_LAND->GetSeaLevel();
+                Vector3 forward = Direction();
+                forward[1] = 0.0f;
+                if (forward.SquareSize() < 0.01f)
+                    forward = VForward;
+                else
+                    forward.Normalize();
+                Vector3Val pos = Position();
+                const WaterSurfaceSample center = QueryWaterSurface(pos.X(), pos.Z(), waveTime, seaLevel);
+                const WaterSurfaceSample front =
+                    QueryWaterSurface(pos.X() + forward.X() * 0.65f, pos.Z() + forward.Z() * 0.65f, waveTime, seaLevel);
+                const WaterSurfaceSample back =
+                    QueryWaterSurface(pos.X() - forward.X() * 0.65f, pos.Z() - forward.Z() * 0.65f, waveTime, seaLevel);
+                const float forwardSlope = (front.height - back.height) / 1.30f;
+                Vector3 waterNormal(center.normalX, center.normalY, center.normalZ);
+                const float normalForward = waterNormal.X() * forward.X() + waterNormal.Z() * forward.Z();
+                waterNormal += forward * (-forwardSlope - normalForward);
+                waterNormal.Normalize();
+                const float localPlaneRoughness = sqrt(1.0f - waterNormal.Y() * waterNormal.Y()) / waterNormal.Y();
+                const float waterPlaneY = (front.height + center.height + back.height) * (1.0f / 3.0f);
+                float immersion = waterPlaneY - pos.Y() + 0.75f;
+                saturate(immersion, 0.0f, 1.35f);
+
+                // Spring-damper buoyancy follows the local CPU water plane; it never snaps
+                // position or alters legacy move/freefall state. The normal-derived roughness
+                // modestly increases drag on steeper water without affecting player input.
+                // Stiffness sets the float height: equilibrium sits where stiffness*immersion = g,
+                // so pos.Y settles at waterPlaneY + (0.75 - g/stiffness). At the old 16 that was
+                // only +0.14 m — the swimmer rode almost level with the surface and every crest
+                // washed over them. 26 lifts equilibrium to about +0.38 m so the head stays clear
+                // of ordinary waves and only larger crests submerge it. Damping is raised with it
+                // to keep the same settling behaviour rather than letting the stiffer spring ring.
+                pForce[1] += GetMass() * (26.0f * immersion - speed[1] * 6.5f);
+                const float waterVelocityX = (front.velocityX + center.velocityX + back.velocityX) * (1.0f / 3.0f);
+                const float waterVelocityZ = (front.velocityZ + center.velocityZ + back.velocityZ) * (1.0f / 3.0f);
+                const float waterRoughness = (front.roughness + center.roughness + back.roughness) * (1.0f / 3.0f);
+                const float drag = 2.5f + (waterRoughness + localPlaneRoughness * 0.5f) * 3.0f;
+                pForce[0] -= (speed[0] - waterVelocityX) * GetMass() * drag;
+                pForce[2] -= (speed[2] - waterVelocityZ) * GetMass() * drag;
+            }
             force += pForce;
 
             saturate(_angMomentum[0], -10, +10);
@@ -504,9 +550,9 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
                                     landDX = info.dX, landDZ = info.dZ;
                                     if (info.obj == nullptr)
                                     {
-                                        // not standing on an object -> we are standing on the landscape -> get the surface sound from the landscape
-                                        _surfaceSound =
-                                            GLandscape->SurfaceAt(info.pos.X(), info.pos.Z())._soundEnv;
+                                        // not standing on an object -> we are standing on the landscape -> get the
+                                        // surface sound from the landscape
+                                        _surfaceSound = GLandscape->SurfaceAt(info.pos.X(), info.pos.Z())._soundEnv;
                                     }
                                     else if (info.texture)
                                     {
@@ -868,7 +914,7 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
             {
                 maxSafeDepth = 0.6f;
             }
-            if (_waterDepth > maxSafeDepth)
+            if (_waterDepth > maxSafeDepth && !playerControlled)
             {
                 float drown = (_waterDepth - maxSafeDepth) * (1.0f / 0.5f);
                 saturateMin(drown, 2);
@@ -878,6 +924,74 @@ void Man::Simulate(float deltaT, SimulationImportance prec)
         else
         {
             _waterContact = false;
+        }
+
+        if (playerControlled)
+        {
+            const WaterSurfaceSample water =
+                QueryWaterSurface(Position().X(), Position().Z(), Glob.time.toFloat(), GLOB_LAND->GetSeaLevel());
+            const float planeOffset = water.height - Position().Y();
+            // Separate enter/exit thresholds prevent buoyancy from chattering at crests while
+            // collision remains the authority for whether this location contains water.
+            _waterBuoyancyContact = _waterBuoyancyContact ? (_waterDepth > 0.01f || planeOffset > -0.20f)
+                                                          : (_waterDepth > 0.08f && planeOffset > -0.05f);
+        }
+        else
+        {
+            _waterBuoyancyContact = false;
+        }
+
+        // Rendering-only event production after collision/movement are complete. Do not feed
+        // these values back into infantry simulation; the render path drains the bridge later.
+        if (playerControlled)
+        {
+            SetPlayerWaterDepth(_waterDepth);
+            Vector3Val speed = Speed();
+            const float horizontalSpeed = sqrt(speed.X() * speed.X() + speed.Z() * speed.Z());
+            const bool inWater = _waterDepth > 0.05f;
+            const uint32_t waterFlag =
+                _waterDepth > 0.65f ? HydroWaterInteractionPlayerSwimming : HydroWaterInteractionPlayerWading;
+            if (inWater && _hydroWaterDepth <= 0.05f)
+            {
+                HydroWaterInteractionEvent event{};
+                event.positionRadius[0] = Position().X();
+                event.positionRadius[1] = Position().Z();
+                event.positionRadius[2] = 0.9f;
+                event.positionRadius[3] = 0.45f;
+                event.velocityKind[2] = speed.Y();
+                event.velocityKind[3] = HydroWaterInteractionPlayer;
+                event.timeLifeFoamMass[1] = 1.0f;
+                event.timeLifeFoamMass[2] = 0.5f;
+                event.directionDepthFlags[3] = HydroWaterInteractionPendingImpulse | waterFlag;
+                SubmitWaterInteraction(event);
+            }
+            if (inWater && horizontalSpeed > 0.15f)
+            {
+                HydroWaterInteractionEvent event{};
+                event.positionRadius[0] = Position().X();
+                event.positionRadius[1] = Position().Z();
+                event.positionRadius[2] = 0.5f + horizontalSpeed * 0.18f;
+                event.positionRadius[3] = 0.12f + horizontalSpeed * 0.035f;
+                event.velocityKind[0] = speed.X();
+                event.velocityKind[1] = speed.Z();
+                event.velocityKind[3] = HydroWaterInteractionContinuous;
+                event.timeLifeFoamMass[1] = 0.20f;
+                event.timeLifeFoamMass[2] = 0.20f;
+                // The fourth slot is the renderer-side stable emitter id for continuous events.
+                event.timeLifeFoamMass[3] = 1.0f;
+                event.directionDepthFlags[0] = speed.X() / horizontalSpeed;
+                event.directionDepthFlags[1] = speed.Z() / horizontalSpeed;
+                event.directionDepthFlags[2] = _waterDepth;
+                event.directionDepthFlags[3] =
+                    HydroWaterInteractionPendingImpulse | HydroWaterInteractionCapsule | waterFlag;
+                SubmitWaterInteraction(event);
+            }
+            _hydroWaterDepth = _waterDepth;
+        }
+        else
+        {
+            SetPlayerWaterDepth(0.0f);
+            _hydroWaterDepth = 0.0f;
         }
     } // if (!CheckPredictionFrozen())
 

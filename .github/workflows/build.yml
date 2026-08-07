@@ -3,9 +3,17 @@ name: C++ / Build
 on:
   push:
     branches:
-      - main
+      - new-renderer-infrastructure
   pull_request:
   workflow_dispatch:
+
+# A push supersedes the run before it. The Trident suite is long, so without
+# this a burst of commits leaves several full runs competing for the same hosted
+# runners and every one of them finishes later -- including the only one whose
+# result anybody wants. Superseded runs are cancelled; the newest is the answer.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -55,14 +63,18 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.CWR_ARTIFACT_PREFIX }}-Game-${{ steps.build_metadata.outputs.sha_short }}
-          path: ${{ env.CWR_DIST_DIR }}/PoseidonGame
+          path: |
+            ${{ env.CWR_DIST_DIR }}/PoseidonGame
+            ${{ env.CWR_DIST_DIR }}/libwgpu_renderer.so
           if-no-files-found: error
 
       - name: Upload GameDemo
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.CWR_ARTIFACT_PREFIX }}-GameDemo-${{ steps.build_metadata.outputs.sha_short }}
-          path: ${{ env.CWR_DIST_DIR }}/PoseidonGameDemo
+          path: |
+            ${{ env.CWR_DIST_DIR }}/PoseidonGameDemo
+            ${{ env.CWR_DIST_DIR }}/libwgpu_renderer.so
           if-no-files-found: error
 
       - name: Upload Server
@@ -100,6 +112,14 @@ jobs:
           build-dir: ${{ env.CWR_BUILD_DIR }}
           ctest-exclude: ${{ env.CWR_CTEST_EXCLUDE }}
 
+      - name: Write Preview-0 WGPU manifest
+        run: >
+          python scripts/write_preview0_manifest.py
+          --exe "${{ env.CWR_DIST_DIR }}/PoseidonGame.exe"
+          --dll "${{ env.CWR_BUILD_DIR }}/engine/WgpuRenderer/wgpu_renderer.dll"
+          --cmake-cache "${{ env.CWR_BUILD_DIR }}/CMakeCache.txt"
+          --out "${{ env.CWR_BUILD_DIR }}/preview0-manifest.json"
+
       - name: Upload Game
         uses: actions/upload-artifact@v7
         with:
@@ -108,6 +128,17 @@ jobs:
             ${{ env.CWR_DIST_DIR }}/PoseidonGame.exe
             ${{ env.CWR_DIST_DIR }}/OpenAL32.dll
             ${{ env.CWR_DIST_DIR }}/OpenAL-Soft.LICENSE.txt
+          if-no-files-found: error
+
+      - name: Upload Preview-0 WGPU bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: Preview0-WGPU-${{ steps.build_metadata.outputs.sha_short }}
+          path: |
+            ${{ env.CWR_DIST_DIR }}/PoseidonGame.exe
+            ${{ env.CWR_BUILD_DIR }}/engine/WgpuRenderer/wgpu_renderer.dll
+            ${{ env.CWR_BUILD_DIR }}/preview0-manifest.json
+            docs/roadmap/evidence
           if-no-files-found: error
 
       - name: Upload GameDemo
@@ -190,6 +221,11 @@ jobs:
   trident-test:
     name: Linux Trident
     runs-on: ubuntu-24.04
+    # Integration failures must publish diagnostics promptly; an unbounded
+    # harness process can otherwise keep the Preview-0 CI gate running for
+    # hours without producing a reviewable result.  The bound must still clear
+    # the suite's own runtime -- see the Trident step below.
+    timeout-minutes: 45
     needs:
       - build-linux
       - trident
@@ -275,21 +311,78 @@ jobs:
       - name: Run Trident tests
         env:
           ALSOFT_DRIVERS: 'null'
+          # The Ubuntu runner is a headless compatibility lane.  Keep the
+          # explicit WGPU scenario on wgpu's GL backend under the Xvfb display;
+          # Preview-0's release-tier Vulkan validation remains on Windows.
+          WGPU_BACKEND: 'gl'
           HARNESS_CMD_TIMEOUT_SEC: '180'
           PAPA_BEAR_MASTER_SERVICE: ${{ github.workspace }}/exe/papa-bear-master-service
           TRI_OUTPUT_DIR: ${{ github.workspace }}/trident-output
         run: |
-          xvfb-run -a --server-args="$TRIDENT_XVFB_ARGS" \
+          # The bound exists to stop a hung harness, not to cut the suite short.
+          # Two runs were SIGTERMed at exactly their bound with tests still
+          # queued -- 91499679288 at 15m, then 30758908654 at 35m -- because 81
+          # scenarios run one at a time, each paying a fresh game startup under
+          # Xvfb.  Raising the bound a third time only buys another slow run, so
+          # the suite now runs in parallel instead.
+          #
+          # -j2, not -j4, and the reason is measured rather than cautious.
+          #
+          # Parallelism scales badly here: serial exceeded 2100s, -j4 finished in
+          # 1554s. That is ~1.35x for 4x the concurrency, because the cost is
+          # game startup against a shared Xvfb display and disk, not CPU. So the
+          # extra slots buy little wall time while adding real contention.
+          #
+          # And the contention has a price. Oversubscribing locally reproduces
+          # exactly the failures run 30760957610 hit: HARNESS_PORT spawn
+          # timeouts, UI assertions firing before the display settles, and GL
+          # errors under many concurrent contexts. None of it is state
+          # corruption -- the mods getters read in-process UI state, not shared
+          # files -- it is simply tests whose timing budgets were written for a
+          # machine that is not fighting three other game instances.
+          #
+          # -j2 keeps most of the wall-clock win with far less of that. Trident's
+          # scheduler handles the rest: `exclusive` tests reserve the whole pool
+          # and run alone, multi-instance tests reserve one slot per process.
+          timeout --preserve-status --kill-after=30s 35m \
+            xvfb-run -a --server-args="$TRIDENT_XVFB_ARGS" \
             bash -c 'openbox & trap "kill $!" EXIT; sleep 1; exec "$@"' bash \
             exe/tri test \
             --output-dir "$TRI_OUTPUT_DIR" \
             --render "$TRIDENT_RENDER" \
+            -j2 \
             --retries 2 \
             --skip-tag ci-host-blocked \
             --game-arg --audio \
             --game-arg "$TRIDENT_AUDIO" \
             --game-arg --no-strict \
             tests/integration
+
+      - name: Normalize Trident output permissions
+        if: failure()
+        run: |
+          # The game can create package files with restrictive permissions.  Make
+          # the complete failed-run evidence archiveable before publishing it.
+          chmod -R a+rX trident-output 2>/dev/null || true
+
+      - name: Print Trident startup diagnostics
+        if: failure()
+        run: |
+          # Logs are numbered per game instance, because a parallel run has
+          # several alive at once. Print a bounded number of them: with -j4 and
+          # retries a failing run can leave dozens, and dumping all of them
+          # buries the failure instead of showing it.
+          shopt -s nullglob
+          printed=0
+          for log in trident-output/game_stderr_*.log trident-output/game_stdout_*.log; do
+            [ -s "$log" ] || continue
+            echo "--- $log ---"
+            sed -n '1,240p' "$log"
+            printed=$((printed + 1))
+            [ "$printed" -ge 6 ] && { echo "--- (further instance logs omitted; see the uploaded artifact) ---"; break; }
+          done
+          [ "$printed" -eq 0 ] && echo "(no non-empty game instance logs)"
+          exit 0
 
       - name: Upload Trident output
         if: failure()

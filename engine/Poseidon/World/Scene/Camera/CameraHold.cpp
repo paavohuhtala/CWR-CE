@@ -115,7 +115,7 @@ LSError CameraHolder::Serialize(ParamArchive& ar)
 
 CameraVehicle::CameraVehicle()
     : base(nullptr, VehicleTypes.New("Camera"), -1), _inertia(false), // manual camera simulation
-      _crossHairs(true)
+      _crossHairs(true), _altitudeSpeedScaling(false), _reportedWorldBounds(false), _mouseLookRequiresRightButton(false)
 {
     // set all target properties to invalid values
     _movePos = VZero;
@@ -330,7 +330,14 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
         }
 
         auto& input = InputSubsystem::Instance();
-        deltaT /= GWorld->GetAcceleratedTime();
+        // Manual cameras run in real time so they remain usable during time
+        // acceleration. A paused or nearly-paused simulation must not turn
+        // this conversion into an unbounded movement step.
+        const float acceleratedTime = GWorld->GetAcceleratedTime();
+        if (acceleratedTime > 0.01f)
+        {
+            deltaT /= acceleratedTime;
+        }
         // manual controls
         // use basic controls to control movement
 
@@ -354,7 +361,24 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
         Matrix3 speedOrient;
         speedOrient.SetUpAndDirection(VUp, Direction());
 
-        Vector3 speedWanted = speedOrient * Vector3(aside, up, forward);
+        float speedScale = 1.0f;
+        if (_altitudeSpeedScaling)
+        {
+            // The curve steepens with altitude: precise placement close to the
+            // ground, then rapidly increasing travel speed high above the map.
+            float groundY = GLandscape->SurfaceYAboveWater(Position()[0], Position()[2]);
+            float altitude = fmax(Position()[1] - groundY, 0.0f);
+            speedScale = fmin(1.0f + altitude * 0.03f + altitude * altitude * 0.00002f, 64.0f);
+
+            // Shift is an absolute two-times multiplier for Zeus flight: it
+            // accelerates sideways, vertical, and forward movement equally.
+            if (input.IsKeyDown(SDL_SCANCODE_LSHIFT) || input.IsKeyDown(SDL_SCANCODE_RSHIFT))
+            {
+                speedScale *= 2.0f;
+            }
+        }
+
+        Vector3 speedWanted = speedOrient * Vector3(aside, up, forward) * speedScale;
         if (_inertia)
         {
             // smooth changes
@@ -372,6 +396,49 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
         }
 
         Vector3 position = Position() + _speed * deltaT;
+        if (_altitudeSpeedScaling)
+        {
+            // Zeus is a map-level camera. Its altitude speed boost makes it
+            // easy to cross the landscape in seconds, but terrain sampling
+            // only has valid coordinates inside the loaded world. Keep the
+            // opt-in Zeus camera inside that domain instead of passing an
+            // invalid frustum to Landscape::Draw.
+            const float landSize = GLandscape->GetLandRange() * GLandscape->GetLandGrid();
+            bool constrained = false;
+            if (!position.IsFinite())
+            {
+                position = Vector3(landSize * 0.5f, 50.0f, landSize * 0.5f);
+                _speed = VZero;
+                constrained = true;
+            }
+            else
+            {
+                const float oldX = position[0];
+                const float oldZ = position[2];
+                saturate(position[0], 0.0f, landSize);
+                saturate(position[2], 0.0f, landSize);
+                if (position[0] != oldX)
+                {
+                    _speed[0] = 0.0f;
+                    constrained = true;
+                }
+                if (position[2] != oldZ)
+                {
+                    _speed[2] = 0.0f;
+                    constrained = true;
+                }
+            }
+
+            if (constrained && !_reportedWorldBounds)
+            {
+                LOG_WARN(Input, "Zeus camera reached the terrain boundary; movement was constrained");
+                _reportedWorldBounds = true;
+            }
+            else if (!constrained)
+            {
+                _reportedWorldBounds = false;
+            }
+        }
         float surfY = GLandscape->SurfaceYAboveWater(position[0], position[2]);
         saturateMax(position[1], surfY + 0.05);
         Move(position);
@@ -381,8 +448,18 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
 
         float headSpeed = input.GetKeyValue(SDL_SCANCODE_KP_4) - input.GetKeyValue(SDL_SCANCODE_KP_6);
         float diveSpeed = input.GetKeyValue(SDL_SCANCODE_KP_2) - input.GetKeyValue(SDL_SCANCODE_KP_8);
-        float headChange = headSpeed * 2 * deltaT * _lastFov;
-        float diveChange = diveSpeed * 2 * deltaT * _lastFov;
+        // Manual cameras are used by the debug Zeus mode as well as scripted
+        // cut-scenes.  Match the viewer's mouse-look scale so a free camera
+        // can be flown naturally without relying on the numeric keypad.
+        constexpr float mouseLookScale = 0.005f;
+        // Zeus/free-fly uses inverted mouse axes: move left to look right,
+        // and move down to look up. Keyboard controls retain their normal
+        // directions.
+        const bool mouseLookActive = !_mouseLookRequiresRightButton || input.IsMouseRightDown();
+        const float mouseX = mouseLookActive ? input.GetMouseDeltaX() : 0.0f;
+        const float mouseY = mouseLookActive ? input.GetMouseDeltaY() : 0.0f;
+        float headChange = headSpeed * 2 * deltaT * _lastFov - mouseX * mouseLookScale;
+        float diveChange = diveSpeed * 2 * deltaT * _lastFov + mouseY * mouseLookScale;
         Matrix3 orient = Orientation();
         if (headChange)
         {
@@ -455,12 +532,12 @@ void CameraVehicle::Simulate(float deltaT, SimulationImportance prec)
         {
             _crossHairs = !_crossHairs;
         }
-        if (input.IsKeyPressed(SDL_SCANCODE_V))
+        if (!_mouseLookRequiresRightButton && input.IsKeyPressed(SDL_SCANCODE_V))
         {
             SetDelete(); // vehicle should be removed
             input.ConsumeKeyPress(SDL_SCANCODE_V);
         }
-        if (input.GetActionToDo(UAFire))
+        if (!_mouseLookRequiresRightButton && input.GetActionToDo(UAFire))
         {
             LOG_INFO(Input, "Camera: clipboard save triggered");
             // save text (preferably to clipboard)

@@ -24,6 +24,70 @@ stages around what they actually expose and promotes **coast look** to the front
 
 ## 0. Where we are today (verified 2026-07-11)
 
+### Hydro FFT Phase 1 (2026-07-21)
+
+The wgpu water path has a shared `256 x 256 x 4` inverse FFT backend in
+`rust/src/water/fft.rs`. Each frame evolves the deterministic wind spectrum,
+runs horizontal and vertical inverse stages for three RGBA32F complex packs,
+then composes RGBA16F displacement, slope/dynamics and auxiliary arrays before
+the water render pass. `water.wgsl` samples absolute world xz, preserving CWR's
+camera-relative CDLOD placement and geomorphing. Cascades 1-3 displace geometry;
+all four affect normals. `WGR_WATER_FFT=0` or unavailable backend setup retains
+the 8-band Gerstner carrier.
+
+The FFT phase expanded `WgrWaterParams` to 176 bytes. Its appended packed fields are
+`fft_control = { enabled, seed, min_geometry_wavelength, pad }`,
+`fft_wind_sea = { wind_x, wind_z, speed_mps, sea_state }`, and
+`fft_cascade_lengths = { length0, length1, length2, length3 }`. The current C++
+producer uses deterministic defaults; wire engine weather into `WaterWgpu::BuildQuadtree`
+when a stable renderer-facing wind source is available.
+
+### Hydro FFT Phase 2 spectrum character (2026-07-22)
+
+The `256 x 256 x 4` persistent-`h0` path partitions spectral energy between cascades with
+complementary smooth log-frequency bands. Adjacent cascades blend at the geometric mean of
+their fundamental frequencies, so a frequency contributes a total weight of one rather than
+being independently energised by every overlapping FFT domain. The longest cascade retains
+the low-frequency side of this partition.
+
+`fft_spectrum_init.wgsl` also derives a deterministic, seed-selected cross-swell direction
+and lower peak frequency from the existing wind/sea inputs. Its lobe is deliberately capped at
+12% of the base radial spectrum and includes small opposing and transverse tails. This changes
+only persistent `h0` construction; deep-water evolution, layouts, resolution, C++ defaults,
+and `wave_amp` stay unchanged.
+
+This is controlled procedural character, not artist-controlled dual JONSWAP: there are no
+separate swell direction, period, or energy controls, and the seed must change to choose a
+different swell. It is intentionally conservative to preserve the requested visual wave-height
+budget.
+
+### Hydro v6 shallow/coastal flow (2026-07-21)
+
+`water.wgsl` derives a cosmetic shoreward foam-flow vector from the existing
+farthest-resolved opaque scene depth. It reconstructs water-column depth exactly as
+the shallow tint and shoreline foam do, transforms its screen derivatives into a
+world-xz depth gradient, and only advects procedural shoreline foam inside the valid
+shallow band. Cleared reversed-Z depth is treated as `DEEP`, so missing terrain/depth
+data remains the established deep-ocean path with no invented flow or foam. This is a
+GPU approximation, not a shallow-water solver: it does not change surface height,
+physics, interaction transport, or the FFT field.
+
+`WgrWaterParams` is now 192 bytes and appends
+`flow_direction_speed = { direction_x, direction_z, metres_per_second, water_kind }`.
+`water_kind` is `WGR_WATER_KIND_OCEAN` (0) or `WGR_WATER_KIND_RIVER` (1). Its default
+is zero, preserving current output. A future river batch can use it to scroll its
+foam directionally, but current `WaterWgpu` only emits one global ocean-plane material;
+there is no authored river surface, water-body batch field, or river flow source to set
+without affecting the ocean. A proper river integration therefore needs per-water-body
+draw/material parameters plus an authored reach direction/speed (or a shallow-flow
+tile) before enabling kind 1.
+
+No waterfall renderer path or waterfall asset classification exists in this backend.
+Do not set `water_kind` for waterfalls: a waterfall needs a separately submitted sheet
+mesh/effect with lip/impact geometry, its own directional material, and a receiving
+pool/foam source. Until that path exists, the global horizontal water plane cannot
+represent a vertical fall safely.
+
 ### 0.1 What Stage 1 shipped (the current water)
 
 `engine/WgpuRenderer/rust/src/water/` (`mod.rs` + `water.wgsl`) draws a flat CDLOD grid at the frame's
@@ -267,7 +331,15 @@ Verified against the current renderer; these are the non-obvious decisions the c
   advancing/retreating waterline — with no hard edge. All procedural; zero asset edits; zero gameplay
   impact.
 
-### Stage 3 — Screen-space refraction — **ATTEMPTED then REVERTED (2026-07-11); needs a separate pass**
+### Stage 3 — Opaque-scene refraction fallback — **DONE (2026-07-21)**
+The WGPU path now resolves (MSAA) or copies (1x) the completed HDR scene into a persistent,
+single-sample `wgr_water_scene_snapshot` immediately before its read-only-depth water pass. Water samples
+only that snapshot, never its active colour attachment. A wave-normal screen offset is rejected when the
+resolved opaque reversed-Z depth is nearer than the water fragment, avoiding foreground bleed; unavailable,
+cleared, and below-water cases safely retain the existing body/sky result. This is intentionally a bounded
+opaque-scene approximation: it can include earlier transparent scene draws, but never later HUD/weapon UI.
+
+### Superseded Stage 3 note — dedicated underwater view remains optional
 Screen-space refraction (sampling a pre-water copy of the *composited* scene at a wave-perturbed UV) was
 built and backed out the same day. **Why it can't work here:** the composited frame contains the
 first-person weapon and (third-person) the player model. A screen-space depth guard can't reliably
@@ -293,12 +365,14 @@ colour binding, and the Water-tab controls were all removed; the flat depth-tint
   toward it — no uniform pink wash. Sun disc excluded (per decision: analytic Blinn-Phong glint stays the
   glint source). Env map is disc-free linear radiance; equirect UV convention shared by `fs_sky_env` (bake)
   and `sky_env_sample` (water). **Not yet run in-game** (Rust+shader validated).
-- **4b:** mirrored-camera half-res planar re-render through the **existing multi-view cull path** (mirror =
-  another view, `frustum_planes(mirror_vp)`, its own `set_shadow_view_count`-style view + records). **Add a
-  waterline clip** — the one missing piece (§0.2.3): an oblique near-plane on the mirror projection or an
-  extra `CullParamsGpu` plane so below-water instances are rejected before draw, else FS-clip in the
-  reflected pass. Flip winding; needs a reflected color+depth target + resolve. Composite over 4a where
-  rays miss geometry.
+- **4b: IMPLEMENTED (pending focused in-game validation).** A private reflected camera is appended only to
+  the Rust-side camera upload, so the C++ ABI remains unchanged. The renderer mirrors the camera around the
+  water level, allocates a half-resolution HDR colour/depth target, and renders reflected sky, terrain, and
+  the independently culled GPU-driven opaque scene. Reflected material shaders discard geometry below the
+  absolute-world water clip plane, mirrored pipelines reverse winding, and the generated mip chain supplies
+  roughness filtering for the water lookup. Clouds are composited after the reflected depth resolve; aerial
+  froxels and CPU-streamed transparent objects remain intentionally excluded. GPU timestamp regions expose
+  sky, terrain, objects, clouds, and mip costs separately.
 - **Exit:** grazing water mirrors the sky and coastline; top-down water transmits.
 
 ### Stage 5 — Per-map look settings + Water tab + sky coupling
@@ -348,5 +422,6 @@ stage, behind the water flag with per-effect sub-toggles. **Stages 2 + 2c are DO
 2026-07-11); **Stage 3 (screen-space refraction) was attempted and reverted** — it needs a dedicated
 underwater pass (see above), deferred. Two coast-look bug-fixes also landed 2026-07-11: **foam is now lit**
 (no night glow) and **water reconstructs seabed depth from a FARTHEST-sample MSAA resolve** so A2C foliage
-/ rotor edges no longer ring with foam. Stage 4a (sky reflection) is the next look work — it needs
-`sky.wgsl` refactored into an importable `sky_radiance(dir)` module (§0.3).
+ / rotor edges no longer ring with foam. Stages 4a (sky environment reflection) and 4b (half-resolution
+ planar scene reflection) are implemented; their remaining exit criterion is focused in-game validation of
+ reflection ownership, clipping, and cost using the existing Water debug views and GPU timestamps.

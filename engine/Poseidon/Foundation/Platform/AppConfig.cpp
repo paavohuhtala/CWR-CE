@@ -244,12 +244,9 @@ void AppConfig::ParseCommandLine(int argc, char** argv)
     try
     {
         std::vector<std::string> normalizedArgs = NormalizeLegacyArguments(argc, argv);
+
         if (BuildInfo::ReleaseBuild && ContainsCliArg(normalizedArgs, "--dev"))
-        {
-            _parseFatalError = "--dev is not supported in release builds";
-            _parseFatalExitCode = 2;
-            return;
-        }
+            throw CLI::ValidationError("--dev", "--dev is not supported in release builds");
 
         const CliHelpMode helpMode = DetectHelpMode(normalizedArgs);
         const CliAppRole appRole = DetectAppRole(normalizedArgs);
@@ -316,8 +313,8 @@ void AppConfig::ParseCommandLine(int argc, char** argv)
         displayGroup->add_flag("--menu-scene,!--no-menu-scene", showMenuScene, "Show 3D background scene in menu");
 
         showOption(
-            displayGroup->add_option("--render", _renderBackend,
-                                     "Graphics backend: dummy, gl33, wgpu, auto (default: gl33)")
+            displayGroup
+                ->add_option("--render", _renderBackend, "Graphics backend: dummy, gl33, wgpu, auto (default: wgpu)")
                 ->check(CLI::IsMember({"dummy", "gl33", "wgpu", "auto"})),
             CliHelpVisibility::Full);
 
@@ -561,10 +558,17 @@ void AppConfig::ParseCommandLine(int argc, char** argv)
 
         if (!BuildInfo::ReleaseBuild)
         {
+            // ON by default in non-release builds: these binaries exist to be poked at, and
+            // needing a flag to reach the panel that every renderer setting lives behind was
+            // friction with no upside. Release builds are untouched -- the flag is not even
+            // registered there, and the guard above rejects it outright, so this cannot leak a
+            // dev panel into a shipped build.
+            _devMode = true;
             debugGroup->add_flag(
-                "--dev", _devMode,
-                serverRole ? "Enable developer and test-oriented command-line options"
-                           : "Enable the dev panel (Ctrl+` toggles; Cheats/Game/Console/Profile/Memory/Font tabs)");
+                "--dev,!--no-dev", _devMode,
+                serverRole ? "Developer and test-oriented command-line options (default: on; --no-dev disables)"
+                           : "Dev panel, Ctrl+` toggles (default: on; --no-dev disables). "
+                             "Cheats/Game/Console/Profile/Memory/Font tabs");
         }
 
         showOption(debugGroup->add_option("--vd", _viewDistanceOverride, "Override view distance (bypass 5000 clamp)")
@@ -624,6 +628,18 @@ void AppConfig::ParseCommandLine(int argc, char** argv)
         showOption(debugGroup->add_option("--test-mission,--test", _testMissionPath,
                                           "Run mission folder or mission.sqm directly and exit"),
                    CliHelpVisibility::Dev);
+
+        // Convenience wrapper over --test-mission so a developer can boot straight into a
+        // scratch map without typing a path. Optional NAME (default "devtest") is resolved
+        // against ./dev-missions/ in the WORKING DIRECTORY, which is the game folder for a
+        // normal launch, so this works from an installed copy and not only from the source
+        // tree. Resolved before the -C chdir below, so the lookup is against the directory
+        // the user launched in.
+        CLI::Option* devMapOpt =
+            debugGroup
+                ->add_option("--dev-map", _devMapName, "Boot a scratch map from ./dev-missions/ (default: devtest)")
+                ->expected(0, 1);
+        showOption(devMapOpt, CliHelpVisibility::Dev);
 
         showOption(
             debugGroup
@@ -712,6 +728,9 @@ void AppConfig::ParseCommandLine(int argc, char** argv)
         // Lives at app level, not in either subgroup.
         showOption(app.add_option("--screenshot,-s", _screenshotPath, "Capture a screenshot to this path then exit"),
                    CliHelpVisibility::Full, !serverRole);
+        showOption(app.add_option("--capture-metrics", _captureMetricsPath,
+                                  "Write renderer timing metrics as JSON alongside a capture"),
+                   CliHelpVisibility::Full, !serverRole);
 
         // Positional mission arg — unchecked so an unknown option value
         // (e.g. app-specific --start-display NAME) doesn't trip the
@@ -754,6 +773,44 @@ void AppConfig::ParseCommandLine(int argc, char** argv)
                 _testMissionPath = std::filesystem::absolute(_simulateMissionPath).string();
             }
 
+            // --dev-map NAME feeds the same machinery as --test-mission, so it inherits
+            // the absolute-path handling immediately below. An explicit --test-mission wins:
+            // it is the more specific request.
+            if (devMapOpt->count() > 0 && _testMissionPath.empty())
+            {
+                namespace fs = std::filesystem;
+                const std::string name = _devMapName.empty() ? std::string("devtest") : _devMapName;
+                // A path as given wins, so --dev-map also accepts a full path to a mission
+                // living outside the scratch folder.
+                fs::path candidate(name);
+                std::error_code ec;
+                if (!fs::exists(candidate, ec))
+                {
+                    for (const char* ext : {"", ".abel", ".Demo", ".noe", ".eden", ".cain"})
+                    {
+                        fs::path probe = fs::path("dev-missions") / (name + ext);
+                        if (fs::exists(probe, ec))
+                        {
+                            candidate = probe;
+                            break;
+                        }
+                    }
+                }
+                if (fs::exists(candidate, ec))
+                {
+                    _testMissionPath = candidate.string();
+                }
+                else
+                {
+                    // Name where it looked. Falling through to the main menu in silence reads
+                    // as "the flag does nothing", which is the least useful way to fail.
+                    fprintf(stderr,
+                            "--dev-map: no mission '%s' (tried it as a path and as "
+                            "./dev-missions/%s[.abel|.Demo|...] under '%s')\n",
+                            name.c_str(), name.c_str(), fs::current_path(ec).string().c_str());
+                }
+            }
+
             // Make test-mission path absolute before any chdir (-C) changes the CWD
             if (!_testMissionPath.empty() && _simulateMissionPath.empty())
                 _testMissionPath = std::filesystem::absolute(_testMissionPath).string();
@@ -765,6 +822,8 @@ void AppConfig::ParseCommandLine(int argc, char** argv)
                 _viewerAnimPath = std::filesystem::absolute(_viewerAnimPath).string();
             if (!_screenshotPath.empty())
                 _screenshotPath = std::filesystem::absolute(_screenshotPath).string();
+            if (!_captureMetricsPath.empty())
+                _captureMetricsPath = std::filesystem::absolute(_captureMetricsPath).string();
 
             // --viewer implies skipping splash + menu, and enables loose textures
             // so artists can drop .png/.tga next to the expected .paa.  We also

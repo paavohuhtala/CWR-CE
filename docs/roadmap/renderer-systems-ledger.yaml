@@ -1,0 +1,505 @@
+schema_version: 1
+purpose: >-
+  Register of renderer systems that already ship on the integration branch.
+
+  RND-030 recommendation 3: the shipped renderer systems had no ticket, no owner and
+  no evidence record, so nothing could be assigned against them and nothing could be
+  checked. That gates overlapping renderer work — you cannot safely start a system
+  without knowing whether it already exists under another name.
+
+  This is deliberately NOT in docs/roadmap/status-ledger.yaml. That file is the
+  Preview-0 execution ledger and its validator requires
+  authorised_tickets == execution_queue == ledger ids, so adding these entries would
+  assert they are Preview-0 scope. They are not; they predate it.
+
+  Validated by scripts/validate_renderer_ledger.py, which re-checks every recorded
+  call site against the branch. That check is the point of the file: RND-030's own
+  matrix recorded a plan as shipped on the strength of a symbol that was actually
+  evidence against it, and a hand-maintained table with no verification will drift
+  the same way again.
+
+status_values:
+  SHIPPED: The plan's scope is present in the branch.
+  PARTIAL: Some of it is present. `completeness` says what is missing.
+  SHIPPED_DISABLED: Present and complete, but off by default at runtime.
+
+verification_note: >-
+  `production_call_sites` are verified mechanically by the validator: the file must
+  be tracked and must contain the symbol. That proves the system EXISTS, which is a
+  weaker claim than the plan having landed — exactly the distinction RND-030 got
+  wrong for the shadow plan.
+
+  `completeness` is a judgement, not a mechanical check, so each entry carries the
+  date it was last re-checked item by item against the branch. All twelve were audited
+  on 2026-08-03; an entry reverting to `audited: null` means its claim is carried from
+  a report rather than verified, and should be read as "exists, extent unconfirmed".
+
+  That audit changed three of the twelve, and the errors run in BOTH directions — mostly
+  pessimistic, which is the opposite of what was expected.
+
+  Recorded as MORE complete than they are: HDR (SHIPPED -> PARTIAL; stage 4, NVG and
+  night eye, does not exist) and cascaded shadows (Tier 1 is two of four).
+
+  Recorded as LESS complete than they are: the depth prepass, whose stage 2 is finished
+  though both its plan and the reconciliation report deny it, and GPU culling, whose
+  stage 3 is live rather than inert.
+
+  That last one was got wrong INSIDE this audit before being caught — see RSYS-GPU-CULL
+  and the consolidation record. Verifying one side of an FFI boundary and taking a plan's
+  word for the other is not verification.
+
+systems:
+  - id: RSYS-SHADOW-CASCADES
+    title: Cascaded shadow maps
+    plan: engine/WgpuRenderer/docs/cascaded-shadow-map-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      Tier 1 is two of four. Landed: shadow distance decoupled from the 250 m clamp
+      (Engine.hpp shadowDistance, 400 m default) and splitCoef/distanceCoef exposed in
+      the dev overlay. Not landed: MAX_CASCADES 4 -> 8 at 2048 (still 4, and the dev
+      slider is capped at 4), and the closed-vs-single-sided caster split with
+      front-face culling. Tiers 2 and 3 not audited.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/gfx3d/mod.rs
+        symbol: MAX_CASCADES
+      - file: engine/WgpuRenderer/rust/src/lib.rs
+        symbol: wgr_shadow_cascades
+
+  - id: RSYS-WATER-CDLOD
+    title: GPU CDLOD water surface geometry
+    plan: engine/WgpuRenderer/docs/water-cdlod-geometry-plan.md
+    status: SHIPPED
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      Node selection and range computation are C++ side (BuildQuadtree,
+      ComputeCdlodRanges); the instanced grid mesh and vertex morph are in water/mod.rs
+      and water.wgsl, with GRID_N mirrored between them. Live geometry quality switches
+      rebuild only the range array, not the quadtree or any GPU resource. Node and
+      triangle counts are observable from tests via triWaterNodeCount, and the
+      water_alive fixture bounds them. Nothing outstanding against the plan.
+    production_call_sites:
+      - file: engine/WgpuRenderer/WaterWgpu.cpp
+        symbol: BuildQuadtree
+      - file: engine/WgpuRenderer/WaterWgpu.cpp
+        symbol: ComputeCdlodRanges
+
+  - id: RSYS-WATER-RENDER
+    title: Water surface rendering
+    plan: engine/WgpuRenderer/docs/water-rendering-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-06
+    completeness: >-
+      Plan is REVISED with stage 1 landed, and was the most recently maintained of the
+      renderer plans. The surface itself — FFT cascades, shoaling, foam, interaction,
+      planar reflection and SSR — is live and is the default look.
+
+      PLANAR REFLECTION EDGE, open as of 2026-08-06. Looking DOWN at water leaves a
+      visible boundary where the cloud reflection stops. Three attempts, each fixing a
+      real thing and none fixing this: the reflected camera was inheriting the screen's
+      exact field of view (padded, default 1.35x, right for grazing views); the handover
+      to the sky reflection ran over 3% of the target (widened, then reworked); and the
+      fade was measuring the wrong distance — it discarded reflection over water the
+      target covers, so it now measures the OVERSHOOT and dissolves outward through the
+      mip chain instead. The boundary is reduced but still visible, and the owner has
+      parked it. Whoever picks it up should first settle whether what remains is the
+      planar cutoff or plain Fresnel, which debug view 23 answers directly; do not
+      assume it is the fade again.
+
+      PLAYER RIPPLES work. A 2026-08-05 report that they had stopped was a STALE DEPLOY,
+      not a defect: the running binaries did not match the build, and content-checking
+      them is what settled it. Owner's remaining note is that they could be stronger.
+      Water-tab ripple diagnostics (player depth, events submitted, events drained) were
+      added while chasing it and are worth keeping.
+
+      The underwater compositor is OFF by default (WaterSettings::underwaterEffect,
+      2026-08-03): the look was not good enough to ship on. The pass and its per-pixel
+      wavy waterline exist and are opt-in from the Water tab, along with six tuning
+      controls. See WTR-190, which is parked rather than closed.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/water/mod.rs
+        symbol: pub fn draw
+      - file: engine/WgpuRenderer/rust/src/water/water.wgsl
+        symbol: fn fft_geometry_disp
+
+  - id: RSYS-RENDER-PARAMS
+    title: Consolidated WgrRenderParams FFI block
+    plan: engine/WgpuRenderer/docs/render-params-consolidation-plan.md
+    status: SHIPPED
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      Scope was FFI ergonomics only, with no shader, UBO or visual change, and it is
+      complete against that scope. The 368-byte layout assert is present in ffi.rs and
+      still holds. Nothing outstanding.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/ffi.rs
+        symbol: WgrRenderParams
+
+  - id: RSYS-SKY-VIS-AO
+    title: Terrain sky-visibility ambient occlusion
+    plan: engine/WgpuRenderer/docs/sky-visibility-ambient-plan.md
+    status: SHIPPED
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      Heightfield sky-view factor feeding terrain ambient, plumbed end to end
+      (WgrSkyVisibility, terrain_set_sky_visibility) with strength, floor, contrast and
+      a debug lane exposed for tuning. The underwater froxel pass consumes the same
+      terrain-shadow uniform. Nothing outstanding against the plan.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/ffi.rs
+        symbol: WgrSkyVisibility
+      - file: engine/WgpuRenderer/rust/src/ffi.rs
+        symbol: terrain_set_sky_visibility
+
+  - id: RSYS-HDR
+    title: HDR pipeline — linear target, exposure, bloom, tonemap
+    plan: engine/WgpuRenderer/docs/hdr-pipeline-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      Four of the plan's five stages, so PARTIAL rather than the SHIPPED this entry
+      first carried.
+
+      Stage 1 HDR target + tonemap resolve — done, and ON by default
+      (hdr_enabled defaults true). Stage 2 linear conversion — shader path done.
+      Stage 3 per-ToD exposure — done via UpdateAutoTonemap in EngineWgpu.
+      Stage 5 GPU auto-exposure — done in OUTCOME but not in method: the plan
+      specifies a histogram compute pass, and exposure.wgsl implements a
+      downsample-chain luminance meter (fs_lum_first / fs_lum_down) instead. The
+      "no readback" constraint does hold for the render path — the tonemap resolve
+      textureLoads the 1x1 scale directly, and read_scale is a blocking dev-panel
+      debug path only.
+
+      Stage 4 NVG and night-eye display stage — NOT started. No nvg or night_eye
+      symbol exists anywhere in the renderer, so Engine::EnableNightEye has nothing
+      to route to on this backend.
+
+      Doc drift: the plan's dev-toggle section says "WGR_HDR=1 -- enable the HDR
+      path. Default off = LDR-direct A/B ref". The default is ON, and has been for
+      long enough that the LDR path is the fallback rather than the reference.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/lib.rs
+        symbol: fn ensure_hdr
+      - file: engine/WgpuRenderer/rust/src/bloom.rs
+        symbol: pub fn new
+      - file: engine/WgpuRenderer/rust/src/exposure.rs
+        symbol: pub fn new
+      - file: engine/WgpuRenderer/rust/src/tonemap.rs
+        symbol: pub fn new
+
+  - id: RSYS-BINDLESS
+    title: Bindless object textures and samplers
+    plan: engine/WgpuRenderer/docs/bindless-textures-plan.md
+    status: SHIPPED
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      The plan's "uncommitted, pending user build" caveat is obsolete; committed
+      2026-07-09. SHIPPED is right for the scope the plan claims — it lists its own
+      exclusions rather than leaving them implied, and they still hold: the shadow and
+      2D passes stay single-texture with their own layouts, and overflow past
+      object_texture_cap samples white rather than evicting. Both are deliberate, and
+      neither is a gap against the plan.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/gfx3d/mod.rs
+        symbol: bindless
+      - file: engine/WgpuRenderer/rust/src/gfx3d/gpu_driven.wgsl
+        symbol: bindless
+
+  - id: RSYS-DEPTH-PREPASS
+    title: Opaque depth and normal prepass, Hi-Z
+    plan: engine/WgpuRenderer/docs/depth-prepass-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      Stage-by-stage against the branch, which does NOT match the plan's status line
+      ("Stages 0/2/3 still planned"):
+
+      Stage 0 — NOT done. No overdraw heatmap anywhere in the tree. GPU timer regions
+      exist but none brackets the opaque colour segment; the nearest is GrassPrepass.
+
+      Stage 1 — DONE and ON by default. prepass_enabled defaults true (lib.rs);
+      WGR_PREPASS=0 is a dev A/B only, and unlike several other WGR_* switches it is
+      not overwritten by ConfigureWgpuUltraEnvironment. shaders/gbuffer.wgsl carries
+      the octahedral encode into NORMAL_FORMAT = Rg16Float.
+
+      Stage 2 — DONE, contrary to the plan. The depth target has TEXTURE_BINDING and
+      a depth-aspect view; normal_view() is exposed and bound; both named consumers
+      landed — water takes water_depth_view via set_depth_view, and Hi-Z takes the
+      nearest resolve.
+
+      Stage 3 — one item of three. Foliage cutout uses alpha-to-coverage in BOTH the
+      colour and prepass pipelines (foliage_a2c drives alpha_to_coverage_enabled at
+      two cull.rs sites), which was the MSAA item. No evidence of the prepass replay
+      being folded into the indirect path, nor of extra depth segments.
+
+      So SSAO's stated prerequisite is already met: the normal G-buffer is populated
+      including foliage and is exposed. The plan's remark that "nothing samples it
+      yet" is still true — no consumer exists — but that is a missing consumer, not a
+      missing producer.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/gfx3d/hiz.rs
+        symbol: pub fn build
+      - file: engine/WgpuRenderer/rust/src/gfx3d/cull.wgsl
+        symbol: hiz
+
+  - id: RSYS-GPU-CULL
+    title: GPU-driven culling
+    plan: engine/WgpuRenderer/docs/gpu-culling-and-depth-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      "Stages 1-3 live" (the RND-030 summary) overstates stage 3. The plan's own status
+      block is the accurate one:
+
+      Stage 1 retained data model — built, folded into CullState rather than as the
+      doc's CPU-draw intermediary. Stage 2 CPU-built indirect — done, default-on where
+      the adapter offers INDIRECT_FIRST_INSTANCE (WGR_INDIRECT=0 forces the direct
+      path). Stage 4 Hi-Z occlusion — done.
+
+      Stage 3 GPU cull + LOD compute is LIVE in a shipped client. CORRECTED 2026-08-03:
+      an earlier pass in this same audit recorded it as inert, on the strength of the
+      plan's status block ("Rust DONE, inert; C++ feed + count-trim remain") and without
+      checking the C++ half. Both have landed — wgr_instance_add is called from a
+      _gpuDriven-gated hook in EngineWgpu, and count-trim exists as
+      multi_draw_count_enabled.
+
+      What makes this hard to read off the code: ConfigureWgpuUltraEnvironment in
+      GameApplication sets WGR_GPU_DRIVEN=1 BEFORE the engine is created (as a default,
+      so an explicit override still wins), and GameDemoApplication inherits it. Both
+      halves then see "1". The C++ member initialiser is false, so the path stays off in
+      any process that does not call that function — tools and the dedicated server.
+
+      Stages 5 (multi-view) and 6 (skinned + transparent) are not started. Stage 6 is
+      where RSYS-SKIN-BAKE is meant to be re-enabled; the bake is deliberately off
+      until then because standalone it is pure overhead.
+
+      Audit note: the C++ and Rust gates disagreed on parsing. Rust enables on any
+      value that is not "0"; C++ required exactly "1", despite a comment asserting they
+      mirrored exactly. WGR_GPU_DRIVEN=true therefore enabled the Rust path and left
+      C++ off, silently inert with an "enabled" log line. Fixed by matching the parse;
+      the differing DEFAULT is intentional and was left alone.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/gfx3d/cull.rs
+        symbol: fn frustum_planes
+      - file: engine/WgpuRenderer/rust/src/gfx3d/cull.wgsl
+        symbol: workgroup_size
+
+  - id: RSYS-PROC-SKY
+    title: Procedural sky and atmosphere
+    plan: engine/WgpuRenderer/docs/procedural-sky-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-05
+    completeness: >-
+      Considerably further than "stages 0 and 1 landed" (the RND-030 summary) and
+      further than the plan's own "Stage 2 in progress".
+
+      Stages 0 and 1 (plumbing, clear-sky single scattering, sun disc) — done.
+      Stage 2 (Hillaire LUT model) — present, not merely in progress: LUT machinery
+      appears throughout sky/mod.rs and sky.wgsl. Stage 4 (aerial perspective
+      unified with fog) — done, and it is the live fog path: fog is applied
+      per-fragment in the forward shaders by sampling the aerial-perspective froxel
+      volume, filled per frame from the sky LUTs. Stage 5 (clouds) — a cloud
+      raymarch plus a separate over-scene cloud_composite.wgsl exist.
+
+      Stage 3 (night sky) — STARS DONE 2026-08-05, moon still not. A procedural star
+      field on a cube grid (spherical coordinates bunch stars at the poles) is added
+      before the cloud composite and gated to night by sun altitude, with a brightness
+      slider in the Sky tab. It wheels with the sun's azimuth, which is the celestial
+      clock this UBO can supply; there is deliberately no twinkle, because that needs a
+      per-frame clock the sky UBO does not carry.
+
+      Owner-confirmed working 2026-08-05. TWO GAPS FOUND BY THAT TEST, both open:
+      clouds do NOT occlude the stars even though they are composited afterwards — the
+      ordering argument was mine and it is wrong, so it needs re-testing rather than
+      re-asserting — and real constellations would need a star catalogue (Yale BSC or
+      similar), which is a data job rather than a shader one.
+
+      The moon remains undone: moon_dir is
+      plumbed into the sky UBO and its own comment says the phase is "unused here";
+      nothing in sky.wgsl renders a moon disc, and there are no stars. Grepping for
+      "star" matches only the word "start".
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/sky/mod.rs
+        symbol: pub fn render
+
+  - id: RSYS-FOLIAGE-TRANS
+    title: Foliage translucency
+    plan: engine/WgpuRenderer/docs/foliage-translucency-plan.md
+    status: SHIPPED
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      All three stages are implemented and live on the default path. Stages 1 (leaf SSS,
+      cutout-gated) and 2 (MapType gate, so fences and the player no longer pick up the
+      leaf look) run in the per-draw shaders.
+
+      Stage 3 (spherical canopy normals for bushes and trees) is implemented inside
+      vs_gpu, the GPU-DRIVEN vertex shader, and is LIVE — the game enables GPU-driven
+      rendering by default via ConfigureWgpuUltraEnvironment. CORRECTED 2026-08-03: an
+      earlier pass in this same audit recorded it as opt-in, having wrongly concluded
+      the GPU-driven path was inert. See RSYS-GPU-CULL.
+
+      It is still worth knowing this stage rides the GPU-driven path: any process that
+      does not set WGR_GPU_DRIVEN — tools, the dedicated server, or a harness run of a
+      binary that skips ConfigureWgpuUltraEnvironment — shades foliage without it.
+    production_call_sites:
+      - file: engine/Poseidon/Graphics/Core/Engine.hpp
+        symbol: transScale
+      - file: engine/WgpuRenderer/rust/src/ffi.rs
+        symbol: crown
+
+  - id: RSYS-SKIN-BAKE
+    title: Compute skinning bake
+    plan: engine/WgpuRenderer/docs/compute-skin-bake-plan.md
+    status: SHIPPED_DISABLED
+    owner: null
+    audited: 2026-08-03
+    completeness: >-
+      Accurate as recorded. skin_bake_enabled defaults false; WGR_SKIN_BAKE=1 enables.
+      Phase 1 is implemented and validated, and there is deliberately NO standalone
+      Phase 2 — the plan folds its draw coalescing into the GPU-driven indirect path
+      rather than building it twice, so this system's payoff is blocked on
+      RSYS-GPU-CULL stage 6. Off by default because standalone it is pure overhead:
+      vertex-shader skinning is ~free for OFP's low-poly characters, and shadow and
+      prepass times were measured identical with the bake on and off.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/gfx3d/mod.rs
+        symbol: WGR_SKIN_BAKE
+
+  - id: RSYS-GTAO
+    title: Screen-space ambient occlusion (GTAO)
+    plan: engine/WgpuRenderer/docs/screen-space-ao-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-05
+    completeness: >-
+      Scalar AO, bent-normal directional ambient, and a hierarchical depth-mip march,
+      default ON as of 2026-08-05 on the owner's instruction. Complete against its plan;
+      PARTIAL is about its cost, which is not under control at the Tier 1 configuration.
+
+      The recorded figure — ao_total 0.518 ms of a 6.857 ms frame, "~8% of the GPU frame"
+      — was measured at 800x600. Re-measured 2026-08-05 in the original training mission
+      at the Tier 1 resolution of 3441x1440: ao_prep 0.299 / ao_march 6.335 / ao_blur
+      1.089 = 7.723 ms of a 24.178 ms GPU frame, so **31.9%**, and the horizon march
+      alone is the largest single item in the frame by more than five times the next one.
+
+      Pixel count explains most of it and not all: the area ratio is 10.3x and the march
+      grew 23x. So this is not simply "the old number at a bigger resolution", and the
+      8% figure should not be quoted for any real configuration. slices x steps remains
+      the knob, and it now has a reason to be turned.
+    known_gap: >-
+      Cost at Tier 1 resolution is ~32% of the GPU frame, against a headline figure of 8%
+      measured in an 800x600 window. Needs a quality/cost decision, not a re-measurement.
+    production_call_sites:
+      - file: engine/WgpuRenderer/include/wgpu_renderer.hpp
+        symbol: WgrGtao
+      - file: engine/WgpuRenderer/rust/src/gfx3d/mod.rs
+        symbol: GtaoSettings
+      - file: engine/WgpuRenderer/rust/src/gfx3d/gtao_depth_mips.rs
+        symbol: gtao
+
+  - id: RSYS-INTERIOR-SKY
+    title: Geometry-aware interior sky visibility
+    plan: engine/WgpuRenderer/docs/interior-sky-visibility-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-05
+    completeness: >-
+      Both stages exist and both are default ON as of 2026-08-05: per-frame directional
+      depth maps (Stage 1) and per-model baked sky-visibility volumes storing a scalar
+      and an incoming-sky DIRECTION per voxel (Stage 2). They compose rather than
+      compete — the per-frame maps cover what a per-model volume structurally cannot see
+      (terrain under a building, one object roofing another, movers indoors).
+
+      PARTIAL for two reasons, and the second is the one that matters for a release.
+
+      First, it has not been re-judged. The owner's "patches of strange shadows" verdict
+      was recorded against the per-frame-only version; the cause was later isolated to
+      directional steering quantising across five sampled directions and fixed by baking
+      the direction, but nobody has looked at the result in a real building since.
+
+      Second, section 3d of the plan is absent from the code: no content-hashed disk
+      cache, no background scheduling with a reach = 1 fallback, and no model-variance
+      policy (animated doors, damaged models, alpha-tested glass, proxies, visual LODs,
+      mirrored or negatively scaled instances — a model-space volume is orientation-free
+      but is NOT mirror-free). sky_bake.rs is deliberately pure and synchronous and the
+      layer that was to sit above it was never written.
+
+      **The load-stall estimate was wrong, and measuring it corrected it downward.** The
+      plan's "~500 models is ~10 s" was repeated as though it described this build; it
+      does not. The bake runs once per REGISTERED model, meaning models a mission
+      actually loads, not the library. Measured 2026-08-05 in the original training
+      mission: **8 models, ~0.29 s total**. The per-model arithmetic was right; what was
+      never checked is how many models a mission registers.
+
+      So the cache and background scheduling are still required — a large mission on a
+      full island registers far more than eight, and that number is unmeasured — but this
+      is no longer a reason to hold a release. Per-frame cost is small and measured:
+      cull 0.408 + depth maps 0.163 = 0.570 ms, 2.4% of a 24.178 ms frame.
+    known_gap: >-
+      Section 3d absent (disk cache, background scheduling, model-variance policy). Load
+      cost scales with distinct models registered per mission; measured at 8 models /
+      ~0.29 s, unmeasured for large missions. Result not re-judged by the owner.
+    production_call_sites:
+      - file: engine/WgpuRenderer/include/wgpu_renderer.hpp
+        symbol: WgrSkyVis
+      - file: engine/WgpuRenderer/rust/src/gfx3d/sky_vis.rs
+        symbol: SkyVisSettings
+      - file: engine/WgpuRenderer/rust/src/gfx3d/sky_bake.rs
+        symbol: SkyBake
+
+  - id: RSYS-GRASS
+    title: GPU-placed three-ring grass field
+    plan: engine/WgpuRenderer/docs/grass-plan.md
+    status: PARTIAL
+    owner: null
+    audited: 2026-08-05
+    completeness: >-
+      Ships and is on by default. Three compute-placed LOD rings — near (512² candidates,
+      real blade geometry, the only ring that casts shadows), mid (384², crossed cards
+      keeping a blade silhouette), far (384², terrain-conforming coverage quads, gated off
+      by default). Wind, tracks, interactor and helicopter downwash all drive placement.
+      Measured 2026-08-05 in the reference mission at 3441x1440: prepass 0.970 + colour
+      1.053 + shadow 0.156 = 2.179 ms of a 24.178 ms frame, 9.0%, at 48 647 near and
+      14 165 mid instances.
+
+      Surface detail has two paths: a procedurally generated 8-layer 64x256 array built on
+      the CPU at init, and authored images loaded from disk when present, with a silent
+      deliberate fallback either way. Missing or corrupt images cannot prevent startup.
+
+      PARTIAL for provenance, not for rendering. See known_gap; the rendering half of
+      GRS-GATE-1 is done and the asset half has not started.
+    known_gap: >-
+      GRS-GATE-1 unpassed: assets/ is gitignored, so the authored texture path is dead on
+      any fresh clone and every user gets the procedural look. No ASSET-010 source
+      registry, no licence record for any current image, no deterministic processing
+      recipe, no validated optional package.
+    production_call_sites:
+      - file: engine/WgpuRenderer/rust/src/grass/mod.rs
+        symbol: GrassStats
+      - file: engine/WgpuRenderer/rust/src/grass/blade_atlas.rs
+        symbol: LAYER_W
+      - file: engine/WgpuRenderer/TerrainWgpu.cpp
+        symbol: UploadGrassBladeAtlas
+      - file: engine/WgpuRenderer/include/wgpu_renderer.hpp
+        symbol: WgrGrassParams
+
+unbuilt_candidates: >-
+  Verified by RND-030 as having no implementation, and therefore the correct starting
+  points for new renderer work: forward-plus, gpu-terrain-water-cull,
+  terrain-fractal-detail. Do not start from the systems above without checking this
+  register first — that is what it is for.
+
+  screen-space-ao was on this list and has been removed: it shipped on 2026-08-05 and is
+  registered above as RSYS-GTAO. A stale "unbuilt" entry is worse than a stale "shipped"
+  one — it invites someone to build a system twice.

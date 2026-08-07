@@ -55,6 +55,23 @@ pub struct WgrLogCallbacks {
 }
 
 #[repr(C)]
+pub struct WgrAbiCheck {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub surface_desc_size: u32,
+    pub log_callbacks_size: u32,
+    pub frame_size: u32,
+    pub required_features: u32,
+}
+
+const WGR_ABI_FEATURE_BUILD_ID: u32 = 0x0000_0001;
+const WGR_ABI_FEATURE_SAFE_DIAGNOSTICS: u32 = 0x0000_0002;
+const WGR_ABI_FEATURE_RUNTIME_CAPABILITIES: u32 = 0x0000_0004;
+const WGR_ABI_SUPPORTED_FEATURES: u32 = WGR_ABI_FEATURE_BUILD_ID
+    | WGR_ABI_FEATURE_SAFE_DIAGNOSTICS
+    | WGR_ABI_FEATURE_RUNTIME_CAPABILITIES;
+
+#[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WgrVertex2D {
     // pos.x/y = window pixels, pos.z = depth.
@@ -184,10 +201,10 @@ pub struct WgrDraw3D {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WgrLight {
-    pub pos: WgrVec4,     // xyz = world-absolute position, w = start-attenuation distance
+    pub pos: WgrVec4, // xyz = world-absolute position, w = start-attenuation distance
     pub diffuse: WgrVec4, // rgb = diffuse * nightEffect
     pub ambient: WgrVec4, // rgb = ambient * nightEffect
-    pub dir: WgrVec4,     // xyz = beam direction (spot), w = isSpot (1) else 0
+    pub dir: WgrVec4, // xyz = beam direction (spot), w = isSpot (1) else 0
 }
 
 // --- GPU-driven retained scene (docs/gpu-culling-and-depth-plan.md Stage 3b) ---
@@ -265,15 +282,15 @@ pub struct WgrInstance {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WgrTonemap {
-    pub exposure: f32,    // linear pre-curve multiplier
-    pub mode: f32,        // 0 = passthrough (clamp), 1 = Hable
-    pub encode: f32,      // 0 = write as-is, 1 = linear->sRGB encode
-    pub temperature: f32, // white balance warm(+)/cool(-)
-    pub tint: f32,        // white balance magenta(+)/green(-)
-    pub contrast: f32,    // post-curve contrast (1 = neutral)
-    pub saturation: f32,  // post-curve saturation (1 = neutral)
-    pub lift: f32,        // shadow lift (0 = neutral)
-    pub gain: f32,        // post-curve overall multiply (1 = neutral)
+    pub exposure: f32,        // linear pre-curve multiplier
+    pub mode: f32,            // 0 = passthrough (clamp), 1 = Hable
+    pub encode: f32,          // 0 = write as-is, 1 = linear->sRGB encode
+    pub temperature: f32,     // white balance warm(+)/cool(-)
+    pub tint: f32,            // white balance magenta(+)/green(-)
+    pub contrast: f32,        // post-curve contrast (1 = neutral)
+    pub saturation: f32,      // post-curve saturation (1 = neutral)
+    pub lift: f32,            // shadow lift (0 = neutral)
+    pub gain: f32,            // post-curve overall multiply (1 = neutral)
     pub bloom_intensity: f32, // linear weight of the bloom added to the scene (0 = off)
     pub bloom_threshold: f32, // bloom soft-knee centre (scene-referred luminance)
     pub bloom_knee: f32,      // bloom soft-knee half-width
@@ -318,7 +335,7 @@ pub struct WgrExposure {
 impl Default for WgrExposure {
     fn default() -> Self {
         Self {
-            enabled: 1.0,
+            enabled: 0.0,
             key: 0.18,
             min_scale: 0.25,
             max_scale: 4.0,
@@ -364,13 +381,21 @@ pub struct WgrSky {
     // instead of the physical model's near-black. Blended in by sun altitude.
     // w = camera altitude above sea level (m): the aerial/sky raymarch starts here, so a
     // wrong value makes the march dive below the terrain when flying (huge fake density).
-    pub night_zenith: WgrVec4,  // xyz = night radiance at the zenith, w = camera altitude (m)
+    pub night_zenith: WgrVec4, // xyz = night radiance at the zenith, w = camera altitude (m)
     pub night_horizon: WgrVec4, // xyz = night radiance at the horizon
     // x = sun_dir.y at/above which it is full day (night = 0), y = sun_dir.y at/below
     // which it is full night (night = 1), z = night intensity, w = far-fade range (m):
     // the aerial pass dissolves the terrain edge into the full sky as it nears this
     // distance (the fog/view range) so the horizon has no colour step. 0 = disabled.
     pub night_params: WgrVec4,
+    // Volumetric clouds (plan Stage 5): a raymarched cloud shell composited inside
+    // sky_radiance so it also appears in reflections + SH ambient. See sky.wgsl.
+    pub cloud0: WgrVec4, // x = coverage [0,1], y = extinction (1/m), z = cloud bottom (m ASL), w = cloud top (m ASL)
+    pub cloud1: WgrVec4, // x/y = wind world offset (m, RUNTIME, CPU-wrapped), z = shape scale (1/m), w = detail scale (1/m)
+    pub cloud2: WgrVec4, // x = HG forward g, y = powder strength, z = ambient scale, w = max march distance (m)
+    pub cloud3: WgrVec4, // x = weather scale (1/m), y = weather amount [0,1], z = warp scale (1/m), w = warp amount (m)
+    // Evolution offsets (RUNTIME): x = shape, y = detail, z = weather drift, w = pad.
+    pub cloud4: WgrVec4,
 }
 
 impl Default for WgrSky {
@@ -391,6 +416,15 @@ impl Default for WgrSky {
             night_horizon: [0.35, 0.45, 0.90, 0.0],
             // Full day above +3 deg sun elevation, full night below -8 deg; intensity 0.02.
             night_params: [0.052, -0.139, 0.02, 0.0],
+            // Clouds off by default (coverage 0) so the clear-sky look is unchanged until tuned.
+            cloud0: [0.0, 0.06, 1200.0, 3500.0],
+            // wind world offset (runtime), shape scale 1/9300, detail scale 1/1700 (incommensurate).
+            cloud1: [0.0, 0.0, 1.0 / 9300.0, 1.0 / 1700.0],
+            cloud2: [0.35, 1.0, 1.0, 60_000.0],
+            // weather scale 1/16000, weather amount, warp scale 1/6000, warp amount (m).
+            cloud3: [1.0 / 16_000.0, 0.4, 1.0 / 6_000.0, 900.0],
+            // Evolution offsets are runtime; zero until the first sky-runtime push.
+            cloud4: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -408,14 +442,19 @@ impl Default for WgrSky {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WgrSkyLook {
-    pub rayleigh: WgrVec4,      // xyz = scattering coeff (1/m); w = scale height (m)
-    pub mie: WgrVec4,           // x = coeff, y = g, z = scale height (m), w = turbidity
-    pub ground_sun: WgrVec4,    // xyz = ground albedo; w = sun radiance scale (sunIntensity)
-    pub params: WgrVec4,        // x = sun angular radius (rad), y = exposure, z = planet radius (m), w = atmosphere (m)
-    pub control: WgrVec4,       // x = enabled, y = view samples, z = light samples, w = ozone
-    pub night_zenith: WgrVec4,  // xyz = night radiance at the zenith; w = horizon-haze strength
+    pub rayleigh: WgrVec4,     // xyz = scattering coeff (1/m); w = scale height (m)
+    pub mie: WgrVec4,          // x = coeff, y = g, z = scale height (m), w = turbidity
+    pub ground_sun: WgrVec4,   // xyz = ground albedo; w = sun radiance scale (sunIntensity)
+    pub params: WgrVec4, // x = sun angular radius (rad), y = exposure, z = planet radius (m), w = atmosphere (m)
+    pub control: WgrVec4, // x = enabled, y = view samples, z = light samples, w = ozone
+    pub night_zenith: WgrVec4, // xyz = night radiance at the zenith; w = horizon-haze strength
     pub night_horizon: WgrVec4, // xyz = night radiance at the horizon; w = aerial-shadow strength
-    pub night_params: WgrVec4,  // x = full-day sun_dir.y, y = full-night sun_dir.y, z = night intensity, w = pad
+    pub night_params: WgrVec4, // x = full-day sun_dir.y, y = full-night sun_dir.y, z = night intensity, w = pad
+    // Cloud look (mirrors WgrSky::cloud0/1/2/3; cloud1.xy = wind offset is runtime, ignored here).
+    pub cloud0: WgrVec4, // x = coverage, y = extinction (1/m), z = bottom (m), w = top (m)
+    pub cloud1: WgrVec4, // x/y unused (runtime wind offset), z = shape scale (1/m), w = detail scale (1/m)
+    pub cloud2: WgrVec4, // x = HG forward g, y = powder, z = ambient scale, w = max distance (m)
+    pub cloud3: WgrVec4, // x = weather scale (1/m), y = weather amount, z = warp scale (1/m), w = warp amount (m)
 }
 
 impl Default for WgrSkyLook {
@@ -429,6 +468,10 @@ impl Default for WgrSkyLook {
             night_zenith: [0.15, 0.30, 0.80, 0.0],
             night_horizon: [0.35, 0.45, 0.90, 1.0],
             night_params: [0.052, -0.139, 0.02, 0.0],
+            cloud0: [0.0, 0.06, 1200.0, 3500.0],
+            cloud1: [0.0, 0.0, 1.0 / 9300.0, 1.0 / 1700.0],
+            cloud2: [0.35, 1.0, 1.0, 60_000.0],
+            cloud3: [1.0 / 16_000.0, 0.4, 1.0 / 6_000.0, 900.0],
         }
     }
 }
@@ -442,6 +485,10 @@ pub struct WgrSkyRuntime {
     pub moon_dir: WgrVec4,  // xyz = unit dir TO the moon; w = moon phase
     pub fog_color: WgrVec4, // xyz = scene fog colour; w = fog far-range (m)
     pub misc: WgrVec4,      // x = night factor (0..1), y = camera altitude ASL (m), z/w = pad
+    // Cloud evolution offsets (m, CPU-wrapped like the wind offset): x = shape, y = detail,
+    // z = weather/coverage drift, w = pad. Drifting the noise lookup makes clouds form and
+    // dissolve in place rather than merely translating with the wind.
+    pub cloud_evolve: WgrVec4,
 }
 
 // Long-distance terrain sun-shadow sweep (was wgr_terrain_set_sun_shadow's args).
@@ -456,7 +503,12 @@ pub struct WgrTerrainSunShadow {
 
 impl Default for WgrTerrainSunShadow {
     fn default() -> Self {
-        Self { strength: 1.0, scale: 2, max_steps: 512, penumbra_deg: 1.0 }
+        Self {
+            strength: 1.0,
+            scale: 2,
+            max_steps: 512,
+            penumbra_deg: 1.0,
+        }
     }
 }
 
@@ -506,12 +558,12 @@ pub struct WgrFoliage {
     pub ambient_boost: f32,  // SH ambient multiplier for foliage (1 = off), distance-faded
     pub normal_bend: f32,    // BUSH spherical-normal blend (0 = geometric, 1 = full radial)
     pub crown_y_offset: f32, // BUSH crown-centre Y lift for the spherical normal
-    pub fill_fade_end: f32,  // camera distance (m) by which the SSS fill + ambient boost fade (0 = off)
+    pub fill_fade_end: f32, // camera distance (m) by which the SSS fill + ambient boost fade (0 = off)
     // Cheap GI: scale foliage sky-ambient by the terrain's light level (1 - terrain sun-shadow) so
     // shadowed foliage stops glowing. 0 = off; residual at full shadow is (1 - gi_strength).
     pub gi_strength: f32,
-    pub tree_bend: f32,      // TREE spherical-normal blend (leaf sections only; trunk keeps its normal)
-    pub tree_crown_y: f32,   // TREE crown-centre Y lift (larger than a bush — centre sits mid-trunk)
+    pub tree_bend: f32, // TREE spherical-normal blend (leaf sections only; trunk keeps its normal)
+    pub tree_crown_y: f32, // TREE crown-centre Y lift (larger than a bush — centre sits mid-trunk)
     pub _pad2: f32,
 }
 
@@ -537,6 +589,50 @@ impl Default for WgrFoliage {
     }
 }
 
+// Screen-space ambient occlusion (GTAO), docs/screen-space-ao-plan.md. Rides the WgrRenderParams
+// block rather than getting its own setter: that block is the project's answer to positional-arg
+// ABI bugs (the sky-visibility feature ate two), and a struct in a struct keeps that property.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct WgrGtao {
+    pub enabled: u32, // 0 = the whole pass is skipped and consumers read AO = 1
+    pub debug: u32,   // raw debug view: 0 = off, 1 = AO greyscale, 2 = bent normal RGB
+    pub radius_m: f32,
+    pub strength: f32,
+    pub slices: u32,
+    pub steps: u32,
+    pub max_radius_px: f32,
+    pub thickness: f32,
+    pub blur_radius: f32,
+    pub blur_depth_scale: f32,
+    pub blur_normal_power: f32,
+    pub bent_normal: u32, // 1 = directional ambient via the bent normal (Stage 2)
+    pub max_mip: u32,     // highest mip the horizon march may use; 0 = full res only
+}
+
+impl Default for WgrGtao {
+    fn default() -> Self {
+        // Kept in sync with gfx3d::GtaoSettings::default (the renderer's own frame-0 values) and
+        // with C++ Engine::AoSettings (the runtime source of truth, pushed every frame).
+        let d = crate::gfx3d::GtaoSettings::default();
+        Self {
+            enabled: d.enabled as u32,
+            debug: d.debug_mode,
+            radius_m: d.radius_m,
+            strength: d.strength,
+            slices: d.slices,
+            steps: d.steps,
+            max_radius_px: d.max_radius_px,
+            thickness: d.thickness,
+            blur_radius: d.blur_radius,
+            blur_depth_scale: d.blur_depth_scale,
+            blur_normal_power: d.blur_normal_power,
+            bent_normal: d.bent_normal as u32,
+            max_mip: d.max_mip,
+        }
+    }
+}
+
 // Every imgui-tweakable render parameter that crosses the FFI as a setter, pushed as one block.
 // Passed by pointer only (never uploaded whole), so #[repr(C)] but not Pod. Append future look
 // knobs here; do not add new FFI setters.
@@ -549,6 +645,53 @@ pub struct WgrRenderParams {
     pub terrain_sun_shadow: WgrTerrainSunShadow,
     pub sky_visibility: WgrSkyVisibility,
     pub foliage: WgrFoliage,
+    pub gtao: WgrGtao,
+    pub interior_sky: WgrSkyVis,
+}
+
+// Interior sky visibility (LIT-020, docs/interior-sky-visibility-plan.md). Distinct from
+// `WgrSkyVisibility` above, which is the TERRAIN heightfield's baked sky-view factor: this one is
+// the top-down depth map of the retained OBJECT set, and it is what tells the renderer it is
+// indoors. Rides WgrRenderParams for the same reason WgrGtao does.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct WgrSkyVis {
+    pub enabled: u32,    // 0 = no map rendered, no cull view, consumers read reach = 1
+    pub debug: u32,      // 1 = draw the reach factor as greyscale instead of lighting with it
+    pub resolution: u32, // depth-map edge in texels
+    pub extent: f32,     // HALF the world box, metres (1024 tex / 128 m half = 25 cm/texel)
+    pub height: f32,     // box half-height above/below the camera, metres
+    pub strength: f32,   // 0 = inert, 1 = full attenuation
+    pub floor: f32,      // minimum ambient multiplier in a sealed volume
+    pub kernel: f32,     // softening kernel radius, metres
+    pub bias: f32,       // depth bias, metres (stops open ground occluding itself)
+    pub directional: f32, // 0 = uniform dimming, 1 = steer ambient fully along the open direction
+    // Stage 2: APPLY the per-model baked volumes. Separate from `enabled` because the two are
+    // different implementations of the same idea and the point of having both is to A/B them.
+    // Producing the volumes still needs WGR_SKY_BAKE_VOLUMES at startup (the bake is load-time);
+    // this only decides whether the shading reads them.
+    pub baked: u32,
+}
+
+impl Default for WgrSkyVis {
+    fn default() -> Self {
+        // Kept in sync with gfx3d::sky_vis::SkyVisSettings::default (the renderer's frame-0
+        // values) and with the C++ side, which pushes every frame and therefore wins.
+        let d = crate::gfx3d::sky_vis::SkyVisSettings::default();
+        Self {
+            enabled: d.enabled as u32,
+            debug: d.debug as u32,
+            resolution: d.resolution,
+            extent: d.extent,
+            height: d.height,
+            strength: d.strength,
+            floor: d.floor,
+            kernel: d.kernel,
+            bias: d.bias,
+            directional: d.directional,
+            baked: d.baked as u32,
+        }
+    }
 }
 
 pub const NO_PALETTE: u32 = 0xFFFF_FFFF;
@@ -659,6 +802,7 @@ pub enum WgrCmdKind {
     // No-op on the LDR-direct path. Emitted at the engine's scene->UI seam.
     Resolve = 4,
     DrawWater = 5,
+    DrawGrass = 6,
 }
 
 #[repr(C)]
@@ -716,6 +860,83 @@ pub struct WgrTerrainBatch {
     pub _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WgrGrassBatch {
+    pub camera: u32,
+    pub flags: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WgrGrassTrack {
+    pub x: f32,
+    pub z: f32,
+    pub radius: f32,
+    pub age: f32,
+}
+
+pub const WGR_GRASS_TRACK_COUNT: usize = 96;
+pub const WGR_GRASS_DOWNWASH_COUNT: usize = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WgrGrassDownwash {
+    pub x: f32,
+    pub z: f32,
+    pub radius: f32,
+    pub strength: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WgrGrassParams {
+    pub density: f32,
+    pub spacing: f32,
+    pub near_radius: f32,
+    pub enabled: f32,
+    pub blade_height: f32,
+    pub wind_strength: f32,
+    pub wind_direction: f32,
+    pub far_radius: f32,
+    pub interactor_x: f32,
+    pub interactor_z: f32,
+    pub interactor_radius: f32,
+    pub interactor_strength: f32,
+    pub tracks: [WgrGrassTrack; WGR_GRASS_TRACK_COUNT],
+    pub downwash: [WgrGrassDownwash; WGR_GRASS_DOWNWASH_COUNT],
+    pub debug_ignore_geography_exclusions: f32,
+    pub clumping: f32,
+    pub color_variation: f32,
+    pub transmission: f32,
+    pub cast_shadows: f32,
+    pub apply_fog: f32,
+    pub density_noise_scale: f32,
+    pub density_noise_strength: f32,
+    pub weed_percent: f32,
+    pub flower_percent: f32,
+    pub blade_width_scale: f32,
+    pub use_photo_tuft: f32,
+    pub saturation: f32,
+    pub dry_patches: f32,
+    pub dry_patch_scale: f32,
+    pub _pad3: f32,
+    // Shape and card controls. Trailing vec4 pair keeps the UBO 16-byte aligned.
+    //   shape_mix = (variety, taper jitter, bend jitter, blade texture strength)
+    //   cards     = (alpha cards on, alpha cutoff, card widening, spare)
+    pub shape_variety: f32,
+    pub taper_jitter: f32,
+    pub bend_jitter: f32,
+    pub blade_texture_strength: f32,
+    pub alpha_cards: f32,
+    pub alpha_cutoff: f32,
+    pub card_widen: f32,
+    /// How far a blade arcs over, scaled by its own height. 0 = rigid spikes.
+    pub blade_arch: f32,
+}
+
 // Per-map + per-frame water parameters (a small UBO). See wgpu_renderer.hpp.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -753,6 +974,78 @@ pub struct WgrWaterParams {
     pub foam_intensity: f32,
     pub swash_amp: f32,
     pub swash_speed: f32,
+    pub fft_control: WgrVec4,
+    pub fft_wind_sea: WgrVec4,
+    pub fft_cascade_lengths: WgrVec4,
+    pub flow_direction_speed: WgrVec4,
+    // WTR-003 — water debug views. x = WgrWaterDebugView index (0 = normal shading); the
+    // fragment shader swaps its output for the selected diagnostic. yzw reserved. Appended
+    // at the end so existing lane offsets are unchanged (sizeof 192 -> 208, matching C++).
+    pub debug_params: WgrVec4,
+    // WTR-LOOK — x = energy model (0 legacy, 1 physical), y = glitter gain, z = SSS gain,
+    // w = environment-reflection gain. Appended at the end (sizeof 208 -> 224, matching C++).
+    pub look_params: WgrVec4,
+    // WTR-LOOK — x = physical sea-state coupling on/off, y = residual spectrum amplitude,
+    // z = low water quality, w = shore breaker gain. (sizeof 224 -> 240, matching C++.)
+    pub sea_params: WgrVec4,
+    // Underwater tuning, live from the Water tab. x = engage band in metres (the compositor
+    // runs while the camera is below sea level + this, so a straddling view can still be
+    // classified), y = absorption density multiplier, z = colour bias 0..1 (1 = absorption hue
+    // from the authored deep swatch, 0 = the old neutral curve), w = caustic gain.
+    // (sizeof 240 -> 256, matching C++.)
+    pub underwater_params: WgrVec4,
+    // x = underwater effect enabled (1) or off (0). Gates the compositor itself; the depth in
+    // fft_control.w only gates the water shader's own tint, so without this lane the pass kept
+    // running with the effect switched off (a submerged camera is always inside the engage
+    // band). yzw reserved. (sizeof 256 -> 272, matching C++.)
+    pub underwater_gate: WgrVec4,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WgrWaterCascadeConfig {
+    pub enabled: u32,
+    pub resolution: u32,
+    pub tile_length_x: f32,
+    pub tile_length_y: f32,
+    pub displacement_scale: f32,
+    pub horiz_displacement_scale: f32,
+    pub normal_scale: f32,
+    pub foam_scale: f32,
+    pub wind_speed: f32,
+    pub wind_direction_rad: f32,
+    pub fetch_meters: f32,
+    pub water_depth_meters: f32,
+    pub swell: f32,
+    pub directional_spread: f32,
+    pub short_wave_detail: f32,
+    pub whitecap_threshold: f32,
+    pub spectrum_seed: u32,
+    pub phase_offset_seconds: f32,
+    pub update_rate_hz: f32,
+    pub pad: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<WgrWaterCascadeConfig>() == 80);
+
+pub const MAX_WATER_INTERACTIONS: usize = 48;
+#[repr(C, align(16))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WgrWaterInteractionEvent {
+    pub position_radius: WgrVec4,
+    pub velocity_kind: WgrVec4,
+    pub time_life_foam_mass: WgrVec4,
+    pub direction_depth_flags: WgrVec4,
+}
+#[repr(C, align(16))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WgrWaterInteractionParams {
+    pub domain: WgrVec4,
+    pub previous_domain: WgrVec4,
+    pub grid: WgrVec4,
+    pub physics: WgrVec4,
+    pub misc: WgrVec4,
+    pub weather: WgrVec4,
 }
 
 // One water node (shared grid mesh at world-xz `origin`, `size` wide, level `lod`).
@@ -765,6 +1058,9 @@ pub struct WgrWaterNode {
     pub lod: u32,
     pub morph_start: f32,
     pub morph_end: f32,
+    pub shore_direction: WgrVec2,
+    pub shore_factor: f32,
+    pub _shore_pad: f32,
 }
 
 #[repr(C)]
@@ -829,6 +1125,7 @@ pub struct WgrFrame {
     // GPU water nodes, drawn on WGR_CMD_DRAW_WATER.
     pub water_nodes: WgrSlice<WgrWaterNode>,
     pub water_batches: WgrSlice<WgrWaterBatch>,
+    pub grass_batches: WgrSlice<WgrGrassBatch>,
 }
 
 // Layouts must match wgpu_renderer.hpp exactly (the C++ side static_asserts the same).
@@ -842,13 +1139,15 @@ const _: () = assert!(std::mem::size_of::<WgrModelMaterial>() == 80);
 const _: () = assert!(std::mem::size_of::<WgrModelLod>() == 16);
 const _: () = assert!(std::mem::size_of::<WgrInstance>() == 144);
 const _: () = assert!(std::mem::size_of::<WgrTonemap>() == 48);
-const _: () = assert!(std::mem::size_of::<WgrSky>() == 176);
-const _: () = assert!(std::mem::size_of::<WgrSkyLook>() == 128);
-const _: () = assert!(std::mem::size_of::<WgrSkyRuntime>() == 64);
+const _: () = assert!(std::mem::size_of::<WgrSky>() == 256);
+const _: () = assert!(std::mem::size_of::<WgrSkyLook>() == 192);
+const _: () = assert!(std::mem::size_of::<WgrSkyRuntime>() == 80);
 const _: () = assert!(std::mem::size_of::<WgrTerrainSunShadow>() == 16);
 const _: () = assert!(std::mem::size_of::<WgrSkyVisibility>() == 32);
 const _: () = assert!(std::mem::size_of::<WgrFoliage>() == 48);
-const _: () = assert!(std::mem::size_of::<WgrRenderParams>() == 304);
+const _: () = assert!(std::mem::size_of::<WgrGtao>() == 52);
+const _: () = assert!(std::mem::size_of::<WgrSkyVis>() == 44);
+const _: () = assert!(std::mem::size_of::<WgrRenderParams>() == 464);
 const _: () = assert!(std::mem::size_of::<WgrFrameParams>() == 16);
 const _: () = assert!(std::mem::size_of::<WgrCameraShadow>() == 352);
 const _: () = assert!(std::mem::size_of::<WgrCamera>() == 576);
@@ -860,17 +1159,134 @@ const _: () = assert!(std::mem::size_of::<WgrOverlayDraw>() == 40);
 const _: () = assert!(std::mem::size_of::<WgrTerrainParams>() == 64);
 const _: () = assert!(std::mem::size_of::<WgrTerrainNode>() == 24);
 const _: () = assert!(std::mem::size_of::<WgrTerrainBatch>() == 16);
-const _: () = assert!(std::mem::size_of::<WgrWaterParams>() == 128);
-const _: () = assert!(std::mem::size_of::<WgrWaterNode>() == 24);
+const _: () = assert!(std::mem::size_of::<WgrGrassBatch>() == 16);
+const _: () = assert!(std::mem::size_of::<WgrGrassTrack>() == 16);
+const _: () = assert!(std::mem::size_of::<WgrGrassDownwash>() == 16);
+// 1744 = 109 * 16: the look, shape_mix and cards vec4s keep the UBO aligned.
+const _: () = assert!(std::mem::size_of::<WgrGrassParams>() == 1744);
+const _: () = assert!(std::mem::size_of::<WgrWaterParams>() == 272);
+const _: () = assert!(std::mem::size_of::<WgrWaterNode>() == 40);
 const _: () = assert!(std::mem::size_of::<WgrWaterBatch>() == 16);
+const _: () = assert!(std::mem::size_of::<WgrWaterInteractionEvent>() == 64);
+const _: () = assert!(std::mem::align_of::<WgrWaterInteractionEvent>() == 16);
+const _: () = assert!(std::mem::size_of::<WgrWaterInteractionParams>() == 96);
+const _: () = assert!(std::mem::align_of::<WgrWaterInteractionParams>() == 16);
 const _: () = assert!(std::mem::size_of::<WgrSlice<WgrCamera>>() == 16);
-const _: () = assert!(std::mem::size_of::<WgrFrame>() == 560);
+const _: () = assert!(std::mem::size_of::<WgrFrame>() == 576);
+const _: () = assert!(std::mem::size_of::<WgrAbiCheck>() == 24);
 
 pub type WgrRenderer = Renderer;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wgr_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+}
+
+/// Version of the public C ABI declared in `wgpu_renderer.hpp`.
+///
+/// This intentionally has a separate integer from the crate's package version:
+/// a compatible implementation update must not force a C++ rebuild, while an
+/// ABI change must be made explicit at both sides of the boundary.
+#[unsafe(no_mangle)]
+pub extern "C" fn wgr_abi_version() -> u32 {
+    if cfg!(debug_assertions) {
+        option_env!("WGR_TEST_ABI_VERSION")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(4)
+    } else {
+        4
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wgr_build_id() -> *const c_char {
+    concat!(env!("WGR_BUILD_ID"), "\0").as_ptr() as *const c_char
+}
+
+/// Validate the C++ side's versioned ABI declaration before accepting any
+/// renderer state. Returns 1 only for an exact, known-compatible layout.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_abi_validate(check: *const WgrAbiCheck) -> i32 {
+    let Some(check) = (unsafe { check.as_ref() }) else {
+        return 0;
+    };
+    (check.abi_version == wgr_abi_version()
+        && check.struct_size == std::mem::size_of::<WgrAbiCheck>() as u32
+        && check.surface_desc_size == std::mem::size_of::<WgrSurfaceDesc>() as u32
+        && check.log_callbacks_size == std::mem::size_of::<WgrLogCallbacks>() as u32
+        && check.frame_size == std::mem::size_of::<WgrFrame>() as u32
+        && (check.required_features & !WGR_ABI_SUPPORTED_FEATURES) == 0) as i32
+}
+
+/// Queue one capture of the next fully composited swapchain frame.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_screenshot_request(renderer: *mut WgrRenderer) {
+    if renderer.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        unsafe { &mut *renderer }.request_screenshot()
+    }));
+}
+
+/// Copy the latest requested capture as tightly packed RGBA8. Call once with
+/// null output to query dimensions, then again with `width * height * 4` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_screenshot_take(
+    renderer: *mut WgrRenderer,
+    out: *mut u8,
+    out_len: u32,
+    width: *mut u32,
+    height: *mut u32,
+) -> u32 {
+    if renderer.is_null() || width.is_null() || height.is_null() || (out.is_null() && out_len != 0)
+    {
+        return 0;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let out = if out.is_null() {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(out, out_len as usize) }
+        };
+        unsafe { &mut *renderer }
+            .take_screenshot(out, unsafe { &mut *width }, unsafe { &mut *height })
+    }))
+    .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod abi_tests {
+    #[test]
+    fn exported_abi_version_matches_the_public_contract() {
+        assert_eq!(super::wgr_abi_version(), 4);
+    }
+
+    #[test]
+    fn mismatched_abi_layout_is_refused() {
+        let check = super::WgrAbiCheck {
+            abi_version: super::wgr_abi_version(),
+            struct_size: std::mem::size_of::<super::WgrAbiCheck>() as u32,
+            surface_desc_size: std::mem::size_of::<super::WgrSurfaceDesc>() as u32,
+            log_callbacks_size: std::mem::size_of::<super::WgrLogCallbacks>() as u32,
+            frame_size: 0,
+            required_features: super::WGR_ABI_FEATURE_BUILD_ID,
+        };
+        assert_eq!(unsafe { super::wgr_abi_validate(&check) }, 0);
+    }
+
+    #[test]
+    fn unsupported_abi_feature_is_refused() {
+        let check = super::WgrAbiCheck {
+            abi_version: super::wgr_abi_version(),
+            struct_size: std::mem::size_of::<super::WgrAbiCheck>() as u32,
+            surface_desc_size: std::mem::size_of::<super::WgrSurfaceDesc>() as u32,
+            log_callbacks_size: std::mem::size_of::<super::WgrLogCallbacks>() as u32,
+            frame_size: std::mem::size_of::<super::WgrFrame>() as u32,
+            required_features: 0x8000_0000,
+        };
+        assert_eq!(unsafe { super::wgr_abi_validate(&check) }, 0);
+    }
 }
 
 /// # Safety
@@ -881,7 +1297,7 @@ pub unsafe extern "C" fn wgr_create(
     desc: *const WgrSurfaceDesc,
     log: *const WgrLogCallbacks,
 ) -> *mut WgrRenderer {
-    catch_unwind(AssertUnwindSafe(|| {
+    let result = catch_unwind(AssertUnwindSafe(|| {
         let Some(desc) = (unsafe { desc.as_ref() }) else {
             return std::ptr::null_mut();
         };
@@ -905,8 +1321,31 @@ pub unsafe extern "C" fn wgr_create(
                 std::ptr::null_mut()
             }
         }
-    }))
-    .unwrap_or(std::ptr::null_mut())
+    }));
+    match result {
+        Ok(renderer) => renderer,
+        Err(panic) => {
+            let sink = match unsafe { log.as_ref() } {
+                Some(l) => LogSink {
+                    cb: l.log,
+                    user: l.user,
+                },
+                None => LogSink::none(),
+            };
+            let message = if let Some(text) = panic.downcast_ref::<String>() {
+                text.as_str()
+            } else if let Some(text) = panic.downcast_ref::<&str>() {
+                text
+            } else {
+                "unknown panic payload"
+            };
+            sink.log(
+                log_level::ERROR,
+                &format!("wgpu renderer creation panicked: {message}"),
+            );
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// # Safety
@@ -931,6 +1370,19 @@ pub unsafe extern "C" fn wgr_resize(renderer: *mut WgrRenderer, width: u32, heig
     let _ = catch_unwind(AssertUnwindSafe(|| {
         unsafe { &mut *renderer }.resize(width, height);
     }));
+}
+
+/// # Safety
+/// `renderer` must be a live pointer from `wgr_create`, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_set_present_mode(renderer: *mut WgrRenderer, interval: i32) -> i32 {
+    if renderer.is_null() {
+        return 0;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        unsafe { &mut *renderer }.set_present_mode(interval)
+    }))
+    .unwrap_or(false) as i32
 }
 
 /// Flag for wgr_texture_create: generate the rest of the mip chain from level 0
@@ -1252,7 +1704,10 @@ pub unsafe extern "C" fn wgr_set_cull_params(
 /// # Safety
 /// `renderer` must be live.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wgr_set_suppress_world_objects(renderer: *mut WgrRenderer, suppress: bool) {
+pub unsafe extern "C" fn wgr_set_suppress_world_objects(
+    renderer: *mut WgrRenderer,
+    suppress: bool,
+) {
     if renderer.is_null() {
         return;
     }
@@ -1328,6 +1783,61 @@ pub unsafe extern "C" fn wgr_water_set_params(
     }));
 }
 
+/// # Safety
+/// `renderer` must be live; `config` must point to one valid `WgrWaterCascadeConfig` or be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_water_set_cascade_config(
+    renderer: *mut WgrRenderer,
+    index: u32,
+    config: *const WgrWaterCascadeConfig,
+) {
+    if renderer.is_null() || config.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let renderer = unsafe { &mut *renderer };
+        let config = unsafe { *config };
+        renderer.water_set_cascade_config(index, config);
+    }));
+}
+
+/// # Safety
+/// `renderer` must be live and `params` must point to one valid interaction parameter block.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_water_set_interaction_params(
+    renderer: *mut WgrRenderer,
+    params: *const WgrWaterInteractionParams,
+) {
+    if renderer.is_null() || params.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        unsafe { &mut *renderer }.water_set_interaction_params(unsafe { *params })
+    }));
+}
+
+/// # Safety
+/// `renderer` must be live; `events` must point to `count` records unless `count` is zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_water_submit_interactions(
+    renderer: *mut WgrRenderer,
+    events: *const WgrWaterInteractionEvent,
+    count: u32,
+) {
+    if renderer.is_null() || (events.is_null() && count != 0) {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let count = (count as usize).min(MAX_WATER_INTERACTIONS);
+        let events = if count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(events, count) }
+        };
+        unsafe { &mut *renderer }.water_submit_interactions(events);
+    }));
+}
+
 /// Refresh the terrain params UBO without re-uploading the heightmap — cheap, called
 /// every frame to animate the coast wet band (sea_level/time/swash/wet_*). See wgpu_renderer.hpp.
 ///
@@ -1391,6 +1901,96 @@ pub unsafe extern "C" fn wgr_terrain_set_index_map(
         let count = width as usize * height as usize;
         let slice = unsafe { std::slice::from_raw_parts(indices, count) };
         renderer.terrain_set_index_map(width, height, slice);
+    }));
+}
+
+/// Upload per-land-cell geography flags for GPU grass placement.  The values are
+/// `GeographyInfo::packed`, one `u32` for every landscape cell.
+///
+/// # Safety
+/// `renderer` must be live; `values` must point to at least `width * height` `u32`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_grass_set_geography(
+    renderer: *mut WgrRenderer,
+    width: u32,
+    height: u32,
+    values: *const u32,
+) {
+    if renderer.is_null() || values.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let renderer = unsafe { &mut *renderer };
+        let count = width as usize * height as usize;
+        let values = unsafe { std::slice::from_raw_parts(values, count) };
+        renderer.grass_set_geography(width, height, values);
+    }));
+}
+
+/// GRS-E — upload the photographed grass-tuft texture for the mid LOD's crossed
+/// cards. `rgba` is `width * height` RGBA8 texels.
+///
+/// # Safety
+/// `renderer` must be live; `rgba` must point to at least `width * height * 4` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_grass_set_tuft(
+    renderer: *mut WgrRenderer,
+    width: u32,
+    height: u32,
+    rgba: *const u8,
+) {
+    if renderer.is_null() || rgba.is_null() || width == 0 || height == 0 {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let renderer = unsafe { &mut *renderer };
+        let bytes = width as usize * height as usize * 4;
+        let rgba = unsafe { std::slice::from_raw_parts(rgba, bytes) };
+        renderer.grass_set_tuft(width, height, rgba);
+    }));
+}
+
+/// Upload the opaque, photographed blade-surface texture array used by the
+/// near grass geometry. `rgba` is layer-major RGBA8 with `layers` images of
+/// identical `width * height` dimensions.
+///
+/// # Safety
+/// `renderer` must be live; `rgba` must point to at least
+/// `width * height * layers * 4` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_grass_set_blade_atlas(
+    renderer: *mut WgrRenderer,
+    width: u32,
+    height: u32,
+    layers: u32,
+    rgba: *const u8,
+) {
+    if renderer.is_null() || rgba.is_null() || width == 0 || height == 0 || layers == 0 {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let renderer = unsafe { &mut *renderer };
+        let bytes = width as usize * height as usize * layers as usize * 4;
+        let rgba = unsafe { std::slice::from_raw_parts(rgba, bytes) };
+        renderer.grass_set_blade_atlas(width, height, layers, rgba);
+    }));
+}
+
+/// Update live procedural-grass controls from the developer Grass tab.
+///
+/// # Safety
+/// `renderer` must be live and `params` must point to one valid WgrGrassParams.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_grass_set_params(
+    renderer: *mut WgrRenderer,
+    params: *const WgrGrassParams,
+) {
+    if renderer.is_null() || params.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let renderer = unsafe { &mut *renderer };
+        renderer.grass_set_params(unsafe { *params });
     }));
 }
 
@@ -1468,6 +2068,7 @@ pub unsafe extern "C" fn wgr_render_frame(
         let lights = unsafe { frame.lights.as_slice() };
         let water_nodes = unsafe { frame.water_nodes.as_slice() };
         let water_batches = unsafe { frame.water_batches.as_slice() };
+        let grass_batches = unsafe { frame.grass_batches.as_slice() };
         match renderer.render_frame(
             frame.clear,
             frame.fog_color.to_array(),
@@ -1487,6 +2088,7 @@ pub unsafe extern "C" fn wgr_render_frame(
             lights,
             water_nodes,
             water_batches,
+            grass_batches,
         ) {
             Ok(()) => 0,
             Err(e) => {
@@ -1512,6 +2114,97 @@ pub unsafe extern "C" fn wgr_get_exposure_scale(renderer: *mut WgrRenderer) -> f
     }
     let renderer = unsafe { &*renderer };
     renderer.exposure_scale()
+}
+
+/// WTR-002 — copy the latest completed-frame GPU pass timings into `out_ms` (milliseconds
+/// per region, indexed by `WgrGpuTimerRegion`; -1 = the pass never ran / is reserved).
+/// Non-blocking (values are harvested asynchronously each frame). Returns the region
+/// count written (min of WGR_GPU_TIMER_REGION_COUNT and `out_len`), or 0 when the
+/// renderer is null or the adapter lacks timestamp queries.
+///
+/// # Safety
+/// `renderer` must be a live `WgrRenderer` or null; `out_ms` must point to at least
+/// `out_len` floats, or be null (in which case 0 is returned).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_get_gpu_timings(
+    renderer: *mut WgrRenderer,
+    out_ms: *mut f32,
+    out_len: u32,
+) -> u32 {
+    if renderer.is_null() || out_ms.is_null() || out_len == 0 {
+        return 0;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let renderer = unsafe { &*renderer };
+        let out = unsafe { std::slice::from_raw_parts_mut(out_ms, out_len as usize) };
+        let count = renderer.gpu_timings(out);
+        count.min(out_len)
+    }))
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_get_runtime_capabilities(renderer: *mut WgrRenderer) -> u32 {
+    if renderer.is_null() {
+        return 0;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        unsafe { &*renderer }.runtime_capabilities()
+    }))
+    .unwrap_or(0)
+}
+
+/// GRS-A — grass instance accounting for the Grass tab, mirroring `WgrGrassStats`
+/// in wgpu_renderer.hpp. Counts come from a non-blocking readback of the three
+/// atomic placement counters, so they lag the displayed frame by the ring depth
+/// (~2-3 frames), exactly like the GPU timings.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct WgrGrassStats {
+    pub near_instances: u32,
+    pub mid_instances: u32,
+    pub far_instances: u32,
+    pub near_candidates: u32,
+    pub mid_candidates: u32,
+    pub far_candidates: u32,
+    pub near_vertices: u32,
+    pub mid_vertices: u32,
+    pub far_vertices: u32,
+}
+
+/// Fill `out` with the latest grass instance counts. Returns 1 on success, 0 when
+/// the renderer or `out` is null.
+///
+/// # Safety
+/// `renderer` must be a live `WgrRenderer` or null; `out` must point to a valid
+/// `WgrGrassStats`, or be null (in which case 0 is returned).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_get_grass_stats(
+    renderer: *mut WgrRenderer,
+    out: *mut WgrGrassStats,
+) -> u32 {
+    if renderer.is_null() || out.is_null() {
+        return 0;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let renderer = unsafe { &*renderer };
+        let s = renderer.grass_stats();
+        unsafe {
+            *out = WgrGrassStats {
+                near_instances: s.near_instances,
+                mid_instances: s.mid_instances,
+                far_instances: s.far_instances,
+                near_candidates: s.near_candidates,
+                mid_candidates: s.mid_candidates,
+                far_candidates: s.far_candidates,
+                near_vertices: s.near_vertices,
+                mid_vertices: s.mid_vertices,
+                far_vertices: s.far_vertices,
+            };
+        }
+        1
+    }))
+    .unwrap_or(0)
 }
 
 /// Push the consolidated ImGui-tweakable render params (tonemap, exposure, sky look, terrain
@@ -1553,6 +2246,51 @@ pub unsafe extern "C" fn wgr_set_sky_runtime(
     let renderer = unsafe { &mut *renderer };
     let params = unsafe { &*params };
     renderer.set_sky_runtime(*params);
+}
+
+/// How much wider the planar water reflection's frustum is than the screen's. 1 = the old
+/// behaviour, where a grazing reflection ran off the edge of the reflection target and the
+/// reflected clouds ended in a visible line across the water. Higher covers more angle at
+/// proportionally lower angular resolution.
+///
+/// # Safety
+/// `renderer` must be a live renderer from `wgr_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_set_planar_reflection_pad(renderer: *mut WgrRenderer, pad: f32) {
+    if renderer.is_null() {
+        return;
+    }
+    let renderer = unsafe { &mut *renderer };
+    renderer.set_planar_reflection_pad(pad);
+}
+
+/// Brightness of the procedural star field. 0 = none. Gated to night by sun altitude in the
+/// shader, so this never affects a daytime sky.
+///
+/// # Safety
+/// `renderer` must be a live renderer from `wgr_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_set_star_intensity(renderer: *mut WgrRenderer, intensity: f32) {
+    if renderer.is_null() {
+        return;
+    }
+    let renderer = unsafe { &mut *renderer };
+    renderer.set_star_intensity(intensity);
+}
+
+/// CLD-020: strength of the cloud shadow cast on the ground. 0 = off, 1 = the deck's full
+/// computed transmittance. A separate entry point rather than a new field in WgrSkyLook,
+/// because growing that struct changes a size the ABI handshake checks, and this is one float.
+///
+/// # Safety
+/// `renderer` must be a live renderer from `wgr_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wgr_set_cloud_shadow_strength(renderer: *mut WgrRenderer, strength: f32) {
+    if renderer.is_null() {
+        return;
+    }
+    let renderer = unsafe { &mut *renderer };
+    renderer.set_cloud_shadow_strength(strength);
 }
 
 /// Read one cascade layer of the shadow depth map back as row-major floats

@@ -8,7 +8,7 @@
 
 #define_import_path shading
 
-#import frame::{frame, terrain_sun_shadow, apply_fog, sky_irradiance, sky_vis_ao}
+#import frame::{frame, terrain_sun_shadow, apply_fog, cloud_sun_shadow, sky_irradiance, sky_vis_ao, gtao_ao, gtao_debug_on, gtao_bent_normal_world, gtao_debug_colour, interior_sky_ao, interior_sky_reach, interior_sky_debug_on, interior_sky_ambient_normal}
 #import shadow::shadow_strength
 #import lighting::lights_contrib
 #import color::srgb_to_linear
@@ -40,6 +40,18 @@ fn shade(
     dwx: vec3<f32>,
     dwy: vec3<f32>,
     linear: f32,
+    // Per-model BAKED sky visibility at this point [0,1] (LIT-020 Stage 2), or 1 when the model
+    // has no volume / the feature is off. Multiplies the ambient exactly like the other two
+    // occluders; it is separate from them because it answers a question neither can — "does the
+    // building I am standing in let sky in here" — from geometry resolved in MODEL space, so its
+    // boundaries land on the walls instead of on a camera-relative grid.
+    baked_sky_vis: f32,
+    // The BAKED incoming-sky direction at this point, world space, or zero when the model has no
+    // volume. Steers the sky-irradiance lookup toward where light actually enters — the window —
+    // instead of only scaling how much arrives. Integrated over 41 directions at bake time and
+    // trilinearly filtered, so it varies smoothly; the five-direction per-frame equivalent jumped
+    // between discrete directions across a surface and that quantisation was the shadow patches.
+    baked_sky_dir: vec3<f32>,
     foliage_shadow_ao: f32,
     // Vegetation canopy cutout (leaf/needle section of a plant): enables the dense-canopy
     // self-occlusion darkening in terrain shadow (foliage_shadow_ao). Since Stage 2 (the MapType
@@ -53,6 +65,10 @@ fn shade(
     // cards don't split into a lit/near-black pair at harsh sun angles. Knobs ride in
     // frame.foliage / frame.foliageb / frame.foliagec. See docs/foliage-translucency-plan.md.
     is_foliage: bool,
+    // @builtin(position).xy of the calling fragment — the screen pixel this shade() is for.
+    // Only the screen-space AO needs it; it is passed rather than derived because shade() is
+    // shared by the per-draw and GPU-driven fragment shaders and neither has a global to read.
+    frag_coord: vec2<f32>,
 ) -> vec3<f32> {
     var albedo = albedo_in;
     var m_emissive = mat.emissive;
@@ -95,17 +111,45 @@ fn shade(
     let world_abs = world_pos + frame.cam_pos.xyz;
     let terrain_s = terrain_sun_shadow(world_abs.xz, world_abs.y);
     let sun_occ = select(terrain_s, max(terrain_s, csm_s), sky_lit);
-    let sun_vis = 1.0 - sun_occ;
-    // Sky-visibility AO on the ambient term (both paths), keyed on the object's terrain column.
-    // Orthogonal to sun_occ (direct sun). Off (1.0) when sky_vis_strength = 0.
-    let amb_ao = sky_vis_ao(world_abs.xz);
+    // CLD-020: cloud transmittance MULTIPLIES the remaining direct sun rather than joining the
+    // max() above. The others are binary occluders answering "is something between me and the
+    // sun"; cloud shadow is a partial transmittance, and a thin deck under a ridge should darken
+    // what the ridge already left, not compete with it for the same slot.
+    let sun_vis = (1.0 - sun_occ) * cloud_sun_shadow(world_abs.xz);
+    // Ambient occlusion on the ambient term (both paths), orthogonal to sun_occ (direct sun).
+    // Two independent occluders, so they MULTIPLY (plan §6): sky-visibility is the baked far /
+    // km-scale term keyed on the object's terrain column, GTAO the screen-space near/mid term
+    // that actually sits objects on the ground. Each returns 1 when its feature is off.
+    // Three independent occluders of the sky ambient, so they MULTIPLY: sky-visibility is the
+    // baked km-scale terrain term, GTAO the screen-space near/mid term, and interior sky
+    // visibility the "is there a roof over me" term that neither of the other two can see (one
+    // knows only the heightfield, the other reaches ~2 m and cannot see off-screen geometry).
+    // Each returns 1 when its own feature is off.
+    let amb_ao = sky_vis_ao(world_abs.xz) * gtao_ao(frag_coord)
+        * interior_sky_ao(world_abs, nrm) * clamp(baked_sky_vis, 0.0, 1.0);
     var sun: vec3<f32>;
     if (sky_lit) {
         // Sky-based lighting: frame-global atmosphere sun + DIRECTIONAL sky-irradiance ambient
         // (SH-9 projection of the env map, evaluated per normal), scaled by the skyAmbient knob in
         // sun_ambient.w. albedo is the reflectance via `rgb = albedo * lit`. The per-material folded
         // sun (m_sun_*) is deliberately unused here — see the original fs_main note.
-        var ambient = sky_irradiance(nrm) * frame.sun_ambient.w * amb_ao;
+        // Directional ambient (Stage 2): sample the sky along the direction light actually
+        // reaches this pixel from, not along the surface normal. Near an occluder those differ,
+        // and that difference is what stops a shaded surface reading as a flat wash. Falls back
+        // to the geometric normal when GTAO or the bent-normal path is off.
+        // Steered TWICE, by two occluders at different scales, and the order matters: GTAO's
+        // bent normal is the local (~2 m) open direction from the depth buffer, and the interior
+        // steer then bends that toward the direction the SKY reaches this point from — the
+        // window or doorway. Indoors GTAO has nothing useful to say (the room is bigger than its
+        // radius and the roof is off-screen), so the interior term is what carries the result.
+        var amb_n = interior_sky_ambient_normal(world_abs, gtao_bent_normal_world(frag_coord, nrm));
+        // The baked steer, when this model has a volume. frame.skyvisb.z is the shared
+        // "directional" knob: 0 leaves the ambient purely scaled (the safe default), 1 samples
+        // the sky fully along the direction it enters from.
+        if (dot(baked_sky_dir, baked_sky_dir) > 1e-6 && frame.skyvisb.z > 0.0) {
+            amb_n = normalize(mix(amb_n, baked_sky_dir, frame.skyvisb.z));
+        }
+        var ambient = sky_irradiance(amb_n) * frame.sun_ambient.w * amb_ao;
         // Glass canopies: keep only a fraction of the sky wash so they read as glazing, not a lit
         // diffuse dome (the direct sun sheen + any glint still sit on top).
         if (is_translucent) {
@@ -184,6 +228,16 @@ fn shade(
     // direct sun in shadow above, so it must not double-darken here.
     if (!sky_lit) {
         rgb *= mix(1.0, frame.shadow.ctlb.y, csm_s);
+    }
+    // Debug: the raw AO buffer as greyscale, BEFORE fog — shipped alongside the effect because
+    // judging AO through sun + SH ambient + fog + tonemap is far harder than looking at the
+    // buffer. Terrain does the same, so the whole opaque scene switches together.
+    if (gtao_debug_on() > 0.5) {
+        return gtao_debug_colour(frag_coord, nrm);
+    }
+    // Same, for the interior sky-reach factor: white = open sky above, black = fully roofed.
+    if (interior_sky_debug_on() > 0.5) {
+        return vec3<f32>(interior_sky_reach(world_abs));
     }
     var fog_color = frame.fog_color.rgb;
     if (linear > 0.5) {

@@ -648,6 +648,8 @@ class Engine : public IGraphicsEngine
     void SetBias(int value) override = 0;
 
     virtual void SetGrassParams(float a1, float a2, float a3 = 0, float a4 = 0) {}
+    /// Stamp a local, recovering bend into procedural grass (for explosions and impacts).
+    virtual void AddGrassImpact(Vector3Par /*position*/, float /*radius*/) {}
     virtual bool CanGrass() const { return false; }
 
     bool CanZBias() const override = 0;
@@ -920,6 +922,261 @@ class Engine : public IGraphicsEngine
     virtual FoliageSettings GetFoliageSettings() const { return {}; }
     virtual void SetFoliageSettings(const FoliageSettings& /*s*/) {}
 
+    /// Screen-space ambient occlusion (GTAO) — the SHORT-RANGE complement to the terrain
+    /// sky-visibility AO above. Sky-vis is baked, positional and km-scale: it darkens gorges and
+    /// cliff-bases and structurally cannot see a rock, a wheel or a doorway. GTAO works from the
+    /// depth+normal prepass, so it resolves exactly that band — local folds and the contact
+    /// between objects and the ground. The two occlude independently and are multiplied.
+    ///
+    /// Applied to the AMBIENT term only, on terrain + opaque objects; water is untouched.
+    /// wgpu path only. Default ON since 2026-08-05 (owner call after smoke testing alongside
+    /// LIT-020); its GPU cost is now measured — see the Amb. Occlusion tab's timer rows, which
+    /// were added in the same change specifically so a default-on feature is not also an
+    /// unmeasured one. See docs/screen-space-ao-plan.md.
+    struct AoSettings
+    {
+        bool enabled = true;
+        // Occlusion reach in WORLD metres, projected to pixels per fragment (so AO does not
+        // swell as you walk toward a wall). ~1-2 m reads as contact shadow; larger reads as
+        // soft global shading.
+        float radius = 2.0f;
+        // Exponent on visibility: 1 = the physical result, >1 deepens without crushing to black.
+        float strength = 1.0f;
+        // Per-frame sample budget. There is NO temporal accumulation in this engine (no TAA),
+        // so these have to be enough on their own; the bilateral blur below is the only denoise.
+        // Raise steps before widening the blur — a too-wide blur washes out the contact
+        // darkening that is the whole point.
+        int slices = 3;
+        int steps = 12;
+        // Cost bound: screen radius clamp in pixels. NOT a free knob — whenever it bites it
+        // silently shortens `radius` above, so too low a value reads as "AO does nothing" on
+        // everything close to the camera (measured: 96 px gave a 0.5 m radius at 3 m, not 1.5)
+        // AND makes surfaces BRIGHTEN as you walk toward them, since the shortfall grows with
+        // proximity. Raise it before suspecting anything else.
+        float maxRadiusPixels = 512.0f;
+        // Falloff past the radius. Rejects thin foreground occluders, which otherwise shadow
+        // everything behind them out to infinity (GTAO's classic "sky behind a pole goes black").
+        float thickness = 1.0f;
+        // Bilateral denoise: half-width in taps, plus the depth / normal rejection strengths that
+        // stop AO bleeding across silhouettes and creases.
+        float blurRadius = 6.0f;
+        float blurDepthScale = 24.0f;
+        float blurNormalPower = 8.0f;
+        // Stage 2: sample the sky irradiance along the bent normal (the average direction light
+        // still reaches this pixel from) rather than the surface normal. This is what gives a
+        // shaded surface near an occluder some form instead of a flat wash; it changes WHERE
+        // light comes from, not just how much. Separate toggle so it can be backed out without
+        // losing the scalar AO.
+        bool bentNormal = true;
+        // Highest depth mip the horizon march may climb. 0 = every tap at full resolution.
+        // Default 0 because raising it FLICKERS while the camera moves: which surface wins a
+        // coarse min-reduction changes abruptly as geometry enters the block, and there is no
+        // temporal filter here to absorb it. Raising it extends reach close to surfaces at that
+        // cost. Measured, not assumed — both the snapped and the blended variants were worse.
+        int maxMip = 0;
+        // Raw buffer view on opaque surfaces: 0 = off, 1 = AO as greyscale, 2 = bent normal as
+        // RGB. Tune against this rather than through sun + ambient + fog + tonemap. Mode 2 exists
+        // because mode 1 shows only the scalar term, which made the bent normal impossible to
+        // inspect — it changed nothing in the debug view and everything in the lit one.
+        int debugMode = 0;
+    };
+
+    /// Read / replace the screen-space AO knobs (see AoSettings). Default base returns an
+    /// all-default set; only the wgpu backend stores + pushes it.
+    virtual AoSettings GetAoSettings() const { return {}; }
+    virtual void SetAoSettings(const AoSettings& /*s*/) {}
+
+    /// Interior sky visibility (LIT-020) — the LONG-RANGE, geometry-aware complement to the two
+    /// AO terms above, and the only one that can tell the renderer it is INDOORS. Terrain
+    /// sky-vis knows the heightfield only, so a building is invisible to it; GTAO reaches ~2 m
+    /// and cannot see a roof that is off-screen. This renders a top-down orthographic depth map
+    /// of the object scene and attenuates the sky AMBIENT under it, toward a floor.
+    ///
+    /// Direct sun and local lights are untouched: the cascade shadow maps and the terrain
+    /// sun-shadow mask already occlude the sun, and the local lights are what keep an interior
+    /// readable. wgpu path only. Default OFF. See docs/interior-sky-visibility-plan.md.
+    struct InteriorSkySettings
+    {
+        // Both stages default ON as of 2026-08-05 (owner call). They compose: the per-frame maps
+        // cover what a per-model volume structurally cannot see — terrain under a building, one
+        // object roofing another, movers inside a room — while the baked volumes give a
+        // building's own surfaces edges that follow its geometry.
+        bool enabled = true;
+        // Depth-map edge in texels, and HALF the world box it covers in metres. Together these
+        // set the resolving power: 1024 texels over a 256 m box is 25 cm per texel, which is
+        // enough for roofs and walls but NOT for window reveals (that is Stage 2's per-model
+        // bake, not something a bigger number here fixes — the box has to follow the camera).
+        int resolution = 2048;
+        float extent = 64.0f;
+        // How far above and below the camera the box reaches. Must clear the tallest roof the
+        // player can stand under and the deepest floor they can stand on.
+        float height = 300.0f;
+        // 0 = inert, 1 = full attenuation.
+        float strength = 1.0f;
+        // Minimum ambient multiplier in a sealed volume. NOT a nicety: OFP interiors carry very
+        // few local lights, so an unfloored version of this is a black box you cannot play in.
+        float floorLevel = 0.32f;
+        // Softening kernel radius in metres — roughly how far light appears to reach in past an
+        // opening. This is what grades a porch instead of drawing a hard line at the doorway.
+        float kernel = 1.0f;
+        // Depth bias in metres. Stops a surface that is its own highest geometry (open ground, a
+        // crate in the street) from occluding itself.
+        float bias = 0.25f;
+        // How far to steer the sky-irradiance lookup toward the direction light actually arrives
+        // from. 0 = uniform dimming (a room just gets darker); 1 = fully along the open
+        // direction.
+        //
+        // DEFAULT 0 after smoke testing (2026-08-05). Steering was meant to make a room read as
+        // lit THROUGH its window rather than evenly dimmed, and it does — but with only five
+        // sampled directions the steered normal jumps between them across a surface, and that
+        // quantisation is the hard shadow patches that got this feature parked. Turning it to 0
+        // removed them, which is what identified the cause: the patches were never the depth
+        // map's texel grid, they were the direction set.
+        //
+        // The idea is sound and is not abandoned: the BAKED path samples 41 directions, so
+        // storing a direction per voxel there would steer smoothly. That is the place to bring
+        // it back, not here.
+        float directional = 0.0f;
+        // Stage 2: apply the per-model BAKED volumes instead of the per-frame maps. The volumes
+        // are produced at load time (WGR_SKY_BAKE_VOLUMES); this is the runtime switch for
+        // whether shading reads them, so the two can be compared without a restart.
+        bool baked = true;
+        // Draw the reach factor as greyscale on opaque surfaces instead of lighting with it.
+        // Shipped WITH the effect: judging this through sun + ambient + fog + tonemap is much
+        // harder than looking at the buffer.
+        bool debug = false;
+    };
+
+    /// Read / replace the interior sky-visibility knobs. Default base returns an all-default
+    /// set; only the wgpu backend stores + pushes it.
+    virtual InteriorSkySettings GetInteriorSkySettings() const { return {}; }
+    virtual void SetInteriorSkySettings(const InteriorSkySettings& /*s*/) {}
+
+    /// Procedural terrain grass (wgpu).  Kept separate from foliage: these values control
+    /// GPU-generated ground blades, not authored alpha-tested trees or bushes.
+    struct GrassSettings
+    {
+        bool enabled = true;
+        // Ultra dense is the production default.  The outer GPU LOD keeps the
+        // default 60 m field affordable while the inner cards remain detailed.
+        float density = 1.0f;
+        float spacing = 0.20f;
+        // Detail radius: drives the dense near cards and the mid blade ring.
+        // Both are bounded by their placement grids, so raising this past
+        // roughly 64 m has no effect -- the outer field is `farRadius`.
+        float radius = 30.0f;
+        // Outer terrain-cover ring. 0 = off (the historical behaviour: grass
+        // simply ends at the mid ring). When on it MUST stay above the mid
+        // ring's reach or the far LOD's accept band is empty, so the mapping
+        // in EngineWgpu floors it -- there is no silently-dead middle ground.
+        // Off by default: the flat coverage quads read as a second green
+        // surface over the terrain and look worse than no distant grass.
+        float farRadius = 1.0f;
+        // Density noise: breaks the field into thicker and thinner patches so
+        // coverage is not uniform. Scale is the noise frequency (1/metres);
+        // strength 0 = flat density. 0.55 reproduces the previous hardcoded
+        // 0.45..1.35 coverage range.
+        float densityNoiseScale = 0.075f;
+        float densityNoiseStrength = 0.55f;
+        // Species mix as fractions of all placed plants; grass takes whatever
+        // these two leave. Chosen per clump, so weeds and flowers appear in
+        // drifts rather than sprinkled evenly.
+        // Blade width multiplier. 1.0 is the long-standing look; the near-LOD
+        // photo texture only becomes visible above roughly 3.0, because a stock
+        // 3 cm blade is about 4 pixels wide on screen and a 64 px texture is
+        // averaged to flat colour before it reaches a pixel.
+        float bladeWidth = 1.0f;
+        // Albedo saturation about luma. 1.0 = untouched; lower desaturates the
+        // whole field. Brightness is preserved, so this only pulls colour out.
+        // 0.78 is the authored default -- the raw palette reads too vivid
+        // against CWA's muted terrain.
+        float saturation = 0.78f;
+        // Sun-bleached patches: fraction of the field that dries toward straw, and
+        // the patch size (noise frequency, 1/metres). Its own noise field, so dry
+        // ground does not line up with thin ground.
+        float dryPatches = 0.35f;
+        float dryPatchScale = 0.030f;
+        float weedPercent = 0.12f;
+        float flowerPercent = 0.05f;
+        // Blade silhouette variety. The four grass species shared ONE profile,
+        // so a field read as the same blade repeated over and over -- the first
+        // thing a tester notices standing in it. 0 reproduces that legacy look
+        // exactly, 1 gives eight distinct width/height/taper profiles; the two
+        // jitters spread taper and lean per blade on top of whichever is chosen.
+        float shapeVariety = 1.0f;
+        float taperJitter = 0.35f;
+        float bendJitter = 0.30f;
+        // Global multiplier on the near-LOD photo atlas, on top of its own
+        // distance fade. 0 keeps the procedural surface detail even when the
+        // photo layers are present, which is the quickest way to tell whether a
+        // look problem is the texture or the geometry.
+        float bladeTextureStrength = 1.0f;
+        // Alpha cut-out cards: take the silhouette from the texture instead of
+        // the quad, so one card can carry several blade shapes. This is the
+        // Reforger-style approach and it buys shape variety without more
+        // geometry -- but it discards, which costs the early-Z the solid blade
+        // path relies on, and the widened quad adds overdraw. Off until measured.
+        bool alphaCards = false;
+        float alphaCutoff = 0.5f;
+        float cardWiden = 1.6f;
+        // How far a blade arcs over, as a multiple of its own height. Grass blades are not rigid;
+        // the stock bend moved a tip 5-19 cm on a ~0.8 m blade, roughly ten degrees, which is why
+        // a field of them read as spikes standing to attention. Taller blades arc further, so this
+        // scales with height rather than being an absolute distance. 0 = the old rigid look.
+        float bladeArch = 1.0f;
+        // Mid LOD geometry. Off = the procedural crossed ribbons. On = crossed
+        // cards carrying a photographed grass clump.
+        //
+        // On by default now that assets/grass/meadow-grass-clump-alpha-1024.png
+        // ships: measured opaque mean (0.525, 0.622, 0.127) -- green on every
+        // texel, hard binary alpha, no baked lighting. The legacy PAA fallback
+        // (data\trava1_pmp2.pac) is grey-teal, so if only that is present the
+        // mid ring looks desaturated and this is worth turning off.
+        bool midPhotoTuft = true;
+        float densityBoost = 4.0f; // turns base spacing into a denser placement grid
+        float height = 1.25f;      // authored blade height multiplier
+        // The default follows the weather system that also drives smoke,
+        // parachutes and cloth. The two wind sliders remain a multiplier and
+        // manual fallback for controlled visual testing.
+        bool useLiveWind = true;
+        float windStrength = 1.2f;
+        float windDirection = 0.0f; // degrees, 0 = +X / east
+        // Reference-style field variation. These affect deterministic GPU
+        // hashes, so they do not make blades swim when the camera moves.
+        float clumping = 0.55f;
+        float colorVariation = 0.35f;
+        float transmission = 0.10f;
+        // These are deliberately grass-only controls: terrain and other
+        // world geometry retain the renderer's regular shadow/fog settings.
+        bool castShadows = true;
+        bool applyFog = true;
+        // Developer diagnostic for legacy worlds whose geography flags are
+        // invalid or over-broad. Off by default: it deliberately bypasses
+        // road/forest/building rejection to prove whether placement works.
+        bool ignoreGeographyExclusions = false;
+    };
+      virtual GrassSettings GetGrassSettings() const { return {}; }
+      virtual void SetGrassSettings(const GrassSettings& /*settings*/) {}
+
+      // The active terrain's material layers.  WGPU exposes these so the dev
+      // overlay can explicitly choose which painted surfaces receive blades.
+      // GRS-A — grass instance accounting for the Grass tab's benchmark table.
+      // Counts come from an async readback of the GPU placement counters, so they
+      // lag the displayed frame by a few frames. Returns false on non-wgpu backends.
+      struct GrassStatsOut
+      {
+          unsigned nearInstances = 0, midInstances = 0, farInstances = 0;
+          unsigned nearCandidates = 0, midCandidates = 0, farCandidates = 0;
+          unsigned nearVertices = 0, midVertices = 0, farVertices = 0;
+      };
+      virtual bool GetGrassStats(GrassStatsOut& /*out*/) const { return false; }
+
+      virtual int GetGrassSurfaceCount() const { return 0; }
+      virtual const char* GetGrassLoadedMapName() const { return ""; }
+      virtual const char* GetGrassSurfaceName(int /*index*/) const { return ""; }
+      virtual bool IsGrassSurfaceEnabled(int /*index*/) const { return false; }
+      virtual void SetGrassSurfaceEnabled(int /*index*/, bool /*enabled*/) {}
+
     /// One alpha-tested shadow-caster batch: a contiguous run of the alpha vertex
     /// buffer sharing one caster texture, whose alpha cuts the cast shadow (so
     /// cutout foliage casts a leaf silhouette). Vertices are xyz+uv (5 floats).
@@ -1116,12 +1373,61 @@ class Engine : public IGraphicsEngine
         // horizon), on the same physical radiance scale as the sky/fog. Off = legacy GL33 sun.
         // A toggle for A/B while the look is re-tuned. See lighting.wgsl / EngineWgpu PushFrame.
         bool skyLighting = true;                           // atmosphere-driven surface sun/ambient
-        float skyAmbient = 0.35f;                          // scale on the DIRECTIONAL SH sky-irradiance ambient (objects/terrain sample the env map per normal). Physical now, so expect to re-tune this in the planned sky/tonemap pass
+        float skyAmbient = 1.35f;                          // scale on the DIRECTIONAL SH sky-irradiance ambient (objects/terrain sample the env map per normal). Physical now, so expect to re-tune this in the planned sky/tonemap pass
         // Drive the atmosphere look (exposure/sunIntensity/rayleigh/mie/ozone/turbidity/
         // sun radius/night intensity) from the per-time-of-day preset table each frame,
         // like the tonemap grade. Off = hold the Sky tab's manually edited values so the
         // atmosphere sliders can be tuned. The toggle knobs above are always live.
         bool autoToD = true;                               // interpolate atmosphere from the ToD presets
+
+        // Volumetric clouds (plan Stage 5): a raymarched cloud shell composited into the
+        // procedural sky (so clouds also appear in water reflections + SH ambient). Coverage
+        // spans isolated cumulus (low) to a solid overcast deck (high). Coverage also dims the
+        // directional sun / lifts ambient on the CPU side (PushFrame), so overcast reads flat.
+        // Off by default (coverage 0) so the clear-sky look is unchanged until authored.
+        float cloudCoverage = 0.42f;                       // 0 = clear .. 1 = full overcast
+        // Drive cloudCoverage from the WORLD's overcast (Landscape::GetOvercast) each frame, so
+        // Zeus / the `weather` console command / mission weather all move the sky. Without this
+        // the two are unrelated: Zeus reported an overcast that nothing rendered. When on, the
+        // Coverage slider below is a read-only display of the driven value; turn this off to
+        // author coverage directly.
+        bool cloudCoverageFromWeather = true;
+        float cloudCoverageClear = 0.05f;                  // coverage at overcast 0
+        float cloudCoverageFull = 0.95f;                   // coverage at overcast 1
+        // Cloud EVOLUTION: metres per second of drift through the noise volume, perpendicular to
+        // the wind. Wind alone only translates the field — the same clouds slide past forever.
+        // Drifting the sample position through the third noise axis instead makes them form and
+        // dissolve in place. Deliberately slow: the shape tile is ~9 km, so 8 m/s is a full
+        // turnover in roughly twenty minutes, which reads as weather rather than animation.
+        float cloudEvolve = 8.0f;
+        float cloudDensity = 0.06f;                        // extinction (1/m); higher = more opaque
+        float cloudBottom = 1200.0f;                       // cloud layer base altitude ASL (m)
+        float cloudTop = 3500.0f;                          // cloud layer top altitude ASL (m)
+        float cloudWind[2] = {8.0f, 2.0f};                 // horizontal scroll velocity (m/s)
+        // Anti-repetition: shape + detail tiles sampled at INCOMMENSURATE world sizes so the visual
+        // period is far longer than either; a large-scale weather field drifts coverage across the
+        // sky; a domain warp breaks grid regularity. Sizes are world metres (scale = 1/size).
+        float cloudShapeSize = 9300.0f;                    // base shape tile (m) — large = less tiling
+        float cloudDetailSize = 1700.0f;                   // detail tile (m) — incommensurate with shape
+        float cloudWeatherSize = 16000.0f;                 // coverage-drift field size (m)
+        float cloudWeatherAmount = 0.4f;                   // how much weather varies local coverage (0 = uniform)
+        float cloudWarpSize = 6000.0f;                     // domain-warp field size (m)
+        float cloudWarpAmount = 900.0f;                    // domain-warp displacement (m)
+        float cloudHgG = 0.35f;                            // forward-scatter anisotropy (silver lining)
+        float cloudPowder = 1.0f;                          // Beer-Powder dark-edge strength (0..1)
+        float cloudAmbient = 1.0f;                         // sky-ambient fill scale on the shadowed sides
+        float cloudMaxDist = 60000.0f;                     // march / visibility cap (m); keep <= ~80 km
+        // CLD-020 cloud shadows: the deck dims the direct sun on terrain, objects, grass and
+        // water through a world-anchored transmittance map rebuilt each frame around the camera.
+        // 0 = off (every surface reads fully lit, and the compute pass early-outs per texel).
+        // This is the "approved cheaper fallback" the roadmap allows rather than near/far
+        // clipmaps with reprojection: one 512x512 dispatch, no history, no temporal state.
+        float cloudShadowStrength = 0.85f;
+        // Procedural star field. The night sky had nothing in it at all -- the authored night
+        // floor is a flat blue wash, so a clear night read as black. Gated to night by sun
+        // altitude in the shader, and added before the cloud composite so a deck covers the stars
+        // the way it covers the sky behind them.
+        float starIntensity = 1.0f;
     };
     // True on backends with a procedural sky pass (wgpu); gates the ImGui Sky tab.
     virtual bool SupportsSky() const { return false; }
@@ -1139,7 +1445,10 @@ class Engine : public IGraphicsEngine
     // every later vtable slot and misdispatches across TUs (see git history / memory).
     struct ExposureSettings
     {
-        bool enabled = true;    // auto-exposure on/off (defaulted on to validate the path)
+        // Manual filmic exposure is the stable default. Auto exposure remains available
+        // in the Tonemap tab, but its 4x adaptation range can flash the whole scene
+        // when a player turns from dark terrain toward a bright sky or water glint.
+        bool enabled = false;
         float key = 0.18f;      // target middle-grey luminance (higher = brighter)
         float minScale = 0.25f; // clamp on the exposure multiplier
         float maxScale = 4.0f;
@@ -1163,18 +1472,27 @@ class Engine : public IGraphicsEngine
     struct WaterSettings
     {
         bool enabled = true;         // draw the GPU water surface (off = seabed only, for A/B)
-        float waveAmp = 0.56f;       // overall wave amplitude scale (gentle; buoyancy is flat)
-        float waveChoppy = 0.18f;    // horizontal steepness of the crests
-        float waveSpeed = 1.47f;     // wave animation speed
-        float waveScale = 1.09f;     // wavelength scale (>1 = larger, farther-apart waves)
+        // Neutral multipliers reproduce GodotOceanWaves' authored cascade values.
+        // Those physical spectrum coefficients are already metre-scaled; multiplying
+        // them by 2.4 after removing the erroneous IFFT normalization was excessive.
+        float waveAmp = 1.00f;       // authored reference amplitude (was a calmer 0.40 default)
+        float waveChoppy = 1.0f;     // 1 = reference horizontal displacement
+        float waveSpeed = 1.0f;      // 1 = reference dispersion time
+        float waveScale = 1.0f;      // 1 = reference cascade wavelengths
         // Distance detail LOD: wave detail flattens between these (metres), killing the
         // far-field moiré / repetition — past fadeEnd the water is a smooth horizon mirror.
         float fadeStart = 589.0f;
         float fadeEnd = 865.0f;
-        float warpAmp = 2.52f;       // low-frequency domain warp (m) that de-tiles the field
+        // De-tiling domain warp (metres). A finite FFT texture is necessarily periodic, so at
+        // distance the cascade period reads as a repeating grid on the ocean — the further you
+        // see, the more repeats fit on screen and the more obvious it is. This warps the world ->
+        // FFT lookup through low-gradient value noise whose hash does not repeat within the
+        // playable world, which breaks the period without disturbing the wave shape. 0 reproduces
+        // the reference project's exact sampling (and its tiling); a few metres is enough.
+        float warpAmp = 5.0f;
         float specPower = 11.0f;     // sun-glint sharpness
         float specIntensity = 3.82f; // sun-glint brightness (HDR, blooms)
-        float alpha = 0.65f;         // base opacity (Fresnel raises it toward 1 at grazing angles)
+        float alpha = 1.00f;         // base opacity (Fresnel raises it toward 1 at grazing angles)
         // Sun shadow: terrain heightfield + CSM occlusion removes the sun glint and
         // direct-sun sheen where the water is shadowed; shadowDim additionally darkens
         // the whole shadowed surface (0 = physical sun-only removal, 1 = strong artistic).
@@ -1183,21 +1501,193 @@ class Engine : public IGraphicsEngine
         // tint runs shallowColor -> deepColor with the water column depth (Beer-Lambert-like),
         // and the surface fades to transparent over the last coastFade metres of depth so the
         // coast is a soft wash over the wet beach, not a hard clip line.
-        float shallowColor[3] = {0.126f, 0.252f, 0.279f}; // turquoise shallows (gamma-space)
-        float deepColor[3] = {0.014f, 0.062f, 0.108f};    // dark blue depths
-        float colorExt = 0.043f;  // 1/m: how fast the tint saturates to deepColor with depth
+        // Gamma-space. "Deep" means a SATURATED dark blue, not black: I drove these to near-zero
+        // chasing darker water and the result was a desaturated sea showing nothing but its own
+        // reflection. The body radiance is albedo x irradiance, so a near-black albedo renders as
+        // black no matter how bright the sun is. Real ocean blue comes from volumetric inscattering,
+        // which is far brighter than a surface albedo would suggest — so the body colour has to
+        // carry actual brightness in blue while staying dark in red.
+        float shallowColor[3] = {0.070f, 0.290f, 0.320f}; // coastal turquoise
+        float deepColor[3] = {0.014f, 0.105f, 0.240f};    // saturated deep ocean blue
+        // 1/m extinction. Applied directly (the old 0.15/m floor saturated every bay to the deep
+        // colour by ~20 m, so the turquoise only survived at the waterline); ~0.035 spreads the
+        // shallow -> deep transition over ~60 m, which is what a real shelf looks like from above.
+        // Raised so the turquoise is confined to genuinely shallow water: at 0.16/m the body is
+        // 55% toward the deep colour by 5 m and 96% by 20 m, instead of carrying cyan far out
+        // across the shelf.
+        float colorExt = 0.160f;
         float coastFade = 0.09f;  // m of column depth over which the shore ramps transparent->opaque
         // Coast foam + swash (Stage 2c): a churning foam band at the waterline, and a gentle
         // oscillation of the near-shore water edge in/out over the wet beach. Cosmetic only.
         float foamWidth = 1.12f;   // m of column depth the foam band spans (peaks ~1/4 in)
-        float foamIntensity = 0.16f;// foam brightness / coverage
-        float swashAmp = 0.47f;    // m the near-shore waterline oscillates in/out
+        float foamIntensity = 0.10f;// foam brightness / coverage
+        // WAVE foam: whitecaps and persistent breaker foam on open water, as opposed to the
+        // shoreline band the two values above drive. Separate because they are different
+        // phenomena -- water breaking on land versus a crest collapsing under its own steepness --
+        // and foamIntensity used to scale both, so there was no way to calm the ocean without
+        // also stripping the surf.
+        float waveFoamIntensity = 0.62f;
+        // How strongly deep water suppresses whitecaps. 0 = waves break the same everywhere;
+        // 1 = open ocean stays nearly smooth and breaking is concentrated where it belongs, in
+        // shoaling water near the coast.
+        float waveFoamDeepFalloff = 1.0f;
+        // m the near-shore waterline oscillates in/out. Reduced from 0.47: this shifts the
+        // EFFECTIVE column depth, so on a gently sloping beach half a metre of depth translates
+        // into several metres of horizontal waterline travel, which reads as the water pulling
+        // back off the shore and leaving a gap rather than as a wash.
+        float swashAmp = 0.14f;
         float swashSpeed = 0.018f; // swash cycles per second (very slow = long, lazy wash)
         // Terrain-side wet/intertidal band: near-flat ground just above the (swash-moved) sea
         // level reads as damp sand (darker albedo), registering with the water's edge. Shared
         // by the terrain shader via WgrTerrainParams. wetDarken = 1 disables it.
-        float wetHeight = 0.26f;   // m above sea level the damp band reaches
-        float wetDarken = 0.58f;   // albedo multiplier in the band (1 = no darkening / off)
+        float wetHeight = 4.0f;    // m above sea level the damp band reaches
+        float wetDarken = 0.35f;   // albedo multiplier in the band (1 = no darkening)
+        // Master switch for water splash particles: the restrained CPU rifle-impact spray and
+        // the GPU whitewater/spray billboard emitter. Enabled by default; activity remains at
+        // 0.25 so ordinary impacts and crest spray stay subtle.
+        bool rifleImpactSpray = true;
+        // Multiplier for the GPU whitewater/splash billboard emitter.
+        float waterSplashParticleActivity = 0.25f;
+
+        // WTR-LOOK — surface energy model. The legacy composite capped the Fresnel reflection
+        // weight, scaled the sun specular to 0.12x and multiplied the subsurface-scattering term
+        // by the (near-black) deep body colour, which together flattened the surface into blue
+        // plastic. The physical composite lets Fresnel run uncapped, evaluates the sun lobe at the
+        // variance-filtered roughness so glitter stays stable with distance, and gives SSS its own
+        // light path. Keep the legacy path selectable for A/B captures.
+        bool physicalLook = true;
+        float glitterGain = 1.0f;    // sun-specular gain (1 = the model's own energy)
+        float sssGain = 1.0f;        // subsurface / backlit-crest gain
+        float reflectionGain = 0.7f; // environment-reflection gain (1 = uncapped physical Fresnel)
+        // How much wider the planar reflection renders than the screen's field of view. The
+        // reflected camera otherwise inherits the main projection exactly, so a grazing reflection
+        // needs directions that were never rendered, the lookup falls off the edge of the target,
+        // and the reflected clouds end in a visible line across the water. Padding trades angular
+        // resolution for coverage; the planar sample is mip-filtered on purpose, so a little
+        // softness costs less here than a hard edge. 1.0 = the old behaviour.
+        float reflectionFovPad = 1.35f;
+        // Fraction of the reflection target over which the planar reflection hands back to the
+        // sky/environment sample. Some water cannot be covered by a planar reflection at all --
+        // tilt down and the water beneath you maps outside the mirrored camera's frustum at any
+        // field of view -- so this fade is what carries those pixels. At the old 3% the swap read
+        // as a line across the sea, because planar has parallax-correct clouds and the environment
+        // sample does not. Wider = the reflection loses parallax gradually instead of ending.
+        float reflectionEdgeFade = 0.22f;
+
+        // WTR-LOOK — physical sea-state coupling. The amplitude control used to scale the whole
+        // variance spectrum uniformly, which raised every wave at its existing wavelength: a
+        // rougher sea became short steep chop instead of the long swell a real wind sea grows.
+        // Coupled, the amplitude sets a wind speed (and matching cascade domain lengths), so the
+        // JONSWAP peak frequency moves with it and taller seas are also longer seas.
+        bool seaStateCoupling = true;
+        // Shore breaker gain — the shoaling swell that runs in toward the beach. OFF by default:
+        // the current train is an analytic two-harmonic sine, which can shoal and steepen but
+        // fundamentally cannot overturn, so it never reads as a wave crashing into itself. A real
+        // plunging breaker needs an actual breaking model, not a bigger sine. Left in place and
+        // tunable rather than deleted, but it should stay off until that exists.
+        float shoreWaveGain = 0.10f;
+        // Dev-only performance mode: drops SSR, planar reflection and their scene sampling from
+        // the water fragment shader. Off by default.
+        bool lowQuality = false;
+        // Coast-aware CDLOD geometry density. GodotOceanWaves uses a camera-following clipmap
+        // with Low/High/High8K meshes; our terrain-integrated equivalent changes how far each
+        // fine CDLOD level remains active while preserving shoreline pruning and horizon coverage.
+        // 0 = Performance, 1 = Balanced (default), 2 = Reference High, 3 = Ultra.
+        // Balanced preserves the near-water mesh fidelity while avoiding the much
+        // larger visible patch set of the reference/screenshot tier.
+        int geometryQuality = 1;
+        // Live FFT spectral-map resolution. 512 is the optimized gameplay default;
+        // 1024 matches GodotOceanWaves' authored map size, while 256 is the low tier.
+        // Resource reconstruction happens only when this value changes.
+        int fftResolution = 512;
+
+        // Scene-referred underwater compositor. It reconstructs metric view-ray distance, limits
+        // extinction to the portion of each ray below the surface, and uses the authored
+        // shallow/deep colours.
+        //
+        // OFF by default: the look is not good enough to ship on, and it is the owner's call
+        // that the water reads better without it than with it in its current state. Turn it on
+        // from the dev overlay's Water tab ("Underwater effect") to work on it or to A/B its
+        // cost.
+        //
+        // The flag gates BOTH the fullscreen compositor and the water shader's own underwater
+        // tint (they share fft_control.w), so with it off a submerged view is the plain scene
+        // seen through the water surface, with no volume and no distance fog either. That is
+        // deliberate: half the effect is not better than none of it.
+        bool underwaterEffect = false;
+
+        // Underwater tuning, all live from the Water tab so the look can be dialled in without
+        // a rebuild. Every one of these is inert while underwaterEffect is off.
+        //
+        // The two depth thresholds are the hysteresis band around the local (wave-displaced)
+        // surface: the effect turns ON once the eye is enterDepth below it and stays on until
+        // the eye is exitDepth above it. They are asymmetric on purpose — equal thresholds make
+        // the effect flicker when the eye rides exactly on a moving crest.
+        float underwaterEnterDepth = 0.03f; // m below the surface before the effect engages
+        float underwaterExitDepth = 0.08f;  // m above the surface before it releases
+        // How far above sea level the compositor still runs. It has to run slightly dry so a
+        // view straddling the surface can be classified per ray; well past the crest height it
+        // just pays for froxel and caustic dispatches that produce no water path.
+        float underwaterEngageBand = 1.5f;
+        // Absorption density multiplier. 1.0 is the tuned default; lower is clearer water.
+        float underwaterDensity = 1.0f;
+        // 1 = absorption hue derived from the authored deep colour, so the volume is the same
+        // substance as the surface. 0 = the fixed (0.280, 0.065, 0.020) curve the effect used
+        // before, which had no relation to the water you swam into. Between the two it blends.
+        float underwaterColorBias = 1.0f;
+        // Gain on the caustic pattern cast onto nearby seabed geometry. 1.0 = tuned default.
+        float underwaterCausticGain = 1.0f;
+
+        // WTR-036C / WTR-037 — FFT Cascade Preset (0 = Production Non-Harmonic 4-Cascade, 1 = GodotOceanWaves Reference Style, 2 = Legacy Harmonic 4-Cascade).
+        // The GodotOceanWaves-derived TMA/JONSWAP setup is the gameplay default.  The
+        // non-harmonic production layout remains available for A/B testing, but should
+        // never silently replace the reference look the water system is targeting.
+        int cascadePreset = 1;
+
+        // WTR-003 — water debug view selector (dev-only; the Water tab "Debug views" section).
+        // 0 = normal shading; any other value is a WgrWaterDebugView index that the wgpu water
+        // shader maps to an on-surface diagnostic (FFT/interaction/foam/reflection/refraction).
+        // Backend-agnostic: non-wgpu engines ignore it. Written to WgrWaterParams.debug_params.x.
+        int debugView = 0;
+
+        // WTR-004 — standard test scene selector (dev-only; 0 = None / Authored, 1..10 = WTR-Test-01..10).
+        int testScene = 0;
+
+        // WTR-001 — deterministic water debug controls (dev-only; the Water tab "Debug" section).
+        // All freezes are renderer-local: they override the UBO time/dt the shader sees, without
+        // touching Glob.time (gameplay / net clock) or any non-water subsystem other than the cloud
+        // wind offset + underwater caustic clock (which ride the same water sim clock by design).
+        // Use these to make a single frame reproducible across launches for before/after captures
+        // and shader-diff work (WTR-002 GPU timestamps and WTR-003 debug views rely on this).
+        struct Freeze
+        {
+            // Master switches (each gate is independent so subsystems can be frozen in combination).
+            bool freezeTime = false;          // hold the water-sim clock at fixedTime
+            bool freezeFft = false;           // skip Fft::dispatch (the spectrum holds at its last state)
+            bool freezeInteraction = false;    // skip Interaction::dispatch (dt forced to 0 beforehand)
+            bool freezeFoam = false;          // skip Foam::dispatch
+            bool freezeClouds = false;        // hold the cloud wind world offset at fixedTime
+            bool freezeWeather = false;       // hold the rain/calmness weather vector sent to the
+                                             // interaction solver (no per-frame recomputation today,
+                                             // but reserved so future weather threading stays A/B-safe)
+            // Fixed sim time (seconds) substituted for Glob.time when any freeze*that uses the clock
+            // is enabled. One value drives water waves, interaction now-impulse, cloud wind offset,
+            // and the underwater caustic clock, so all four stay coherent for a single test frame.
+            float fixedTime = 0.0f;
+            // Deterministic FFT random seed override (replaces fft_control[1]; -1 = use the
+            // authored 1337 default so the spectrum only re-seeds when the user asks for it).
+            // Toggling the value (even back) rewrites h0 on the next Fft::dispatch.
+            int fftSeed = -1;
+            // Fixed delta time (seconds) for the interaction solver when freezeInteraction is OFF.
+            // 0 = use the live frame delta clamped to 1/30 (existing behaviour). Non-zero fixes the
+            // simulation step so the ripple solver runs at the same rate regardless of render fps.
+            float fixedDelta = 0.0f;
+            // Repeatable-camera-path foundation (WTR-001: smallest necessary scaffolding). The full
+            // camera-path recorder is a separate work package; here we expose a single integer that,
+            // when >= 0, the renderer logs each frame along with the water UBO digest so two runs are
+            // comparable frame-by-frame. The actual camera-driver work is WTR-Test-* (WTR-004).
+            int cameraPathFrame = -1;
+        } freeze;
     };
     // True on backends with a GPU water renderer (wgpu with water enabled); gates the tab.
     virtual bool SupportsWater() const { return false; }
@@ -1241,6 +1731,36 @@ class Engine : public IGraphicsEngine
     // §12d: is proxy `proxyIndex` at parent LOD `level` drawn by the GPU retained scene (as a child
     // instance)? Object::DrawProxies skips it if so, to avoid double-drawing the furniture.
     virtual bool GpuDrivenProxy(const Object* /*parent*/, int /*level*/, int /*proxyIndex*/) const { return false; }
+
+    // WTR-002 — GPU water-pipeline pass timings (Water tab, dev-only). Copies up to maxCount
+    // per-region times in milliseconds into outMs (indexed by the renderer's fixed region
+    // contract; -1 = pass never ran / reserved slot) and returns the region count, or 0 when
+    // the backend has no GPU timers. Names come from GetWaterGpuTimingName so the overlay
+    // stays backend-agnostic. APPENDED at the class end (vtable-slot note above).
+    virtual int GetWaterGpuTimings(float* /*outMs*/, int /*maxCount*/) const { return 0; }
+    virtual const char* GetWaterGpuTimingName(int /*region*/) const { return ""; }
+    // Live WGPU adapter/runtime flags for the Profile diagnostic tab. Appended to
+    // preserve existing vtable slots; zero means unavailable/non-WGPU.
+    virtual uint32_t GetRuntimeCapabilityFlags() const { return 0; }
+
+    // GetWaterGpuTimings returns ONE shared region array covering every timed
+    // subsystem; each debug tab slices its own range. Mirrors WgrGpuTimerRegion
+    // in wgpu_renderer.hpp (append only, never reorder).
+    enum : int
+    {
+        kWaterGpuRegionBegin = 0,
+        kWaterGpuRegionEnd = 19,
+        kGrassGpuRegionBegin = 19,
+        kGrassGpuRegionEnd = 25,
+        kFrameGpuRegionTotal = 25,
+        // LIT-020 — sliced by the Interior Sky tab.
+        kInteriorSkyGpuRegionBegin = 26,
+        kInteriorSkyGpuRegionEnd = 28,
+        // LIT-010 — sliced by the Amb. Occlusion tab.
+        kGtaoGpuRegionBegin = 28,
+        kGtaoGpuRegionEnd = 31,
+        kGpuRegionEnd = 31,
+    };
 
   protected:
     // Post-hook fires from OnWindowResized so apps can re-run the aspect policy

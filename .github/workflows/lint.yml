@@ -3,11 +3,97 @@ name: C++ / Lint
 on:
   push:
     branches:
-      - main
+      - new-renderer-infrastructure
   pull_request:
   workflow_dispatch:
 
+# A push supersedes the run before it. The Trident suite is long, so without
+# this a burst of commits leaves several full runs competing for the same hosted
+# runners and every one of them finishes later -- including the only one whose
+# result anybody wants. Superseded runs are cancelled; the newest is the answer.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  preview0-ledger:
+    name: Preview-0 ledger
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The clean Preview-0 manifest pins a historical evidence commit;
+          # the ledger validator verifies its canonical shader blobs.
+          fetch-depth: 0
+
+      - name: Validate execution ledger and overlay
+        run: python3 scripts/validate_preview0_ledger.py
+
+      # Re-checks every production call site the shipped-renderer register claims,
+      # against the branch. Without this the register is another hand-maintained
+      # table that goes stale silently, which is the RND-030 failure it exists to
+      # stop repeating.
+      - name: Validate shipped-renderer register
+        run: python3 scripts/validate_renderer_ledger.py
+
+      # The public capability matrix is generated from the two ledgers above, so
+      # the only way it can lie is by being stale. Regenerating and diffing here
+      # makes that impossible; a hand-maintained version of this table is exactly
+      # what RND-030 found had drifted, and this one is published to people who
+      # have no way to check it.
+      - name: Check capability matrix matches the ledgers
+        run: python3 scripts/generate_capability_matrix.py --check
+
+      # ASSET-010. Source files live under the gitignored assets/ tree so CI has
+      # none of them and the hash checks skip; what this enforces here is that
+      # every entry carries a real licence trail and that only one source is
+      # SELECTED. The hash half runs for whoever does have the files.
+      - name: Validate third-party asset registry
+        run: python3 scripts/validate_asset_registry.py
+
+      # Cheap, and it guards a failure mode that is invisible when it happens:
+      # two tests writing the same screenshot filename is a false pass under a
+      # parallel run, not merely an overwritten file.
+      - name: Check integration screenshot labels are unique
+        run: python3 scripts/check_screenshot_labels.py
+
+      - name: Validate explicit visual-review acceptance gate
+        run: |
+          python3 -m pip install --disable-pip-version-check Pillow
+          probe_dir="$(mktemp -d)"
+          python3 scripts/compare_preview0_captures.py \
+            --reference docs/roadmap/evidence/preview0-gl33-original-training-current-capture-20260801.png \
+            --candidate docs/roadmap/evidence/preview0-wgpu-clean-baseline-20260802-original-training-capture.png \
+            --mask "$probe_dir/accepted.png" \
+            --out "$probe_dir/accepted.json" \
+            --acceptance-profile docs/roadmap/visual-acceptance-profile.preview0-original-training.json \
+            --require-accepted
+          python3 - "$probe_dir/blocking-profile.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+          profile = json.loads(pathlib.Path(
+              "docs/roadmap/visual-acceptance-profile.preview0-original-training.json"
+          ).read_text(encoding="utf-8"))
+          profile["review"]["classification"] = "CORRECTNESS_BUG"
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(profile), encoding="utf-8")
+          PY
+          if python3 scripts/compare_preview0_captures.py \
+            --reference docs/roadmap/evidence/preview0-gl33-original-training-current-capture-20260801.png \
+            --candidate docs/roadmap/evidence/preview0-wgpu-clean-baseline-20260802-original-training-capture.png \
+            --mask "$probe_dir/blocking.png" \
+            --out "$probe_dir/blocking.json" \
+            --acceptance-profile "$probe_dir/blocking-profile.json" \
+            --require-accepted; then
+            echo "CORRECTNESS_BUG review was incorrectly accepted" >&2
+            exit 1
+          fi
+
+      - name: Validate WGPU renderer and composed WGSL
+        run: cargo test --manifest-path engine/WgpuRenderer/rust/Cargo.toml --package wgpu_renderer
+
   clang-format:
     name: Lint
     runs-on: ubuntu-24.04

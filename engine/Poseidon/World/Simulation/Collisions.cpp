@@ -1,5 +1,6 @@
 #include <Poseidon/Core/Application.hpp>
 #include <Poseidon/Core/Config/EngineConfig.hpp>
+#include <Poseidon/Graphics/Core/Engine.hpp>
 #include <Poseidon/World/Terrain/Landscape.hpp>
 #include <stdlib.h>
 #include <cmath>
@@ -31,6 +32,7 @@ using Poseidon::Foundation::MStorage;
 #include <Poseidon/AI/AI.hpp>
 #include <Random/randomGen.hpp>
 #include <Poseidon/Core/Global.hpp>
+#include <Poseidon/Graphics/Rendering/WaterInteractionBridge.hpp>
 #include <Poseidon/Network/Network.hpp>
 #include <Poseidon/World/Scene/Thing.hpp>
 #include <Poseidon/Dev/Diag/DiagModes.hpp>
@@ -882,6 +884,26 @@ void Landscape::ExplosionDammageEffects(EntityAI* owner, Shot* shot, Object* dir
         return;
     }
 
+    // Grass reactions are visual-only and are deliberately driven from this
+    // shared impact path, so local and replicated explosions bend identically.
+    // Restrict it to explosive ammo: ordinary bullet strikes should not mash a
+    // visible circular patch into the meadow.
+    if (type->explosive && GEngine)
+    {
+        const float radius = std::clamp(2.0f + std::sqrt(std::max(type->hit, 0.0f)) * 0.55f, 2.0f, 14.0f);
+        GEngine->AddGrassImpact(pos, radius);
+    }
+
+    // Collision paths for distant terrain tiles can bypass ShotShell's explicit
+    // sea-intersection branch and arrive here as a normal ground impact. Suppress
+    // that legacy presentation too when a non-explosive round is at the waterline.
+    // The Water tab switch deliberately controls both paths; Hydro ripples remain
+    // renderer-side and are not affected.
+    if (!type->explosive && pos.Y() <= GetSeaLevel() + 0.3f && !RifleWaterImpactSprayEnabled())
+    {
+        return;
+    }
+
     AIUnit* ownerUnit = owner ? owner->CommanderUnit() : nullptr;
     AIGroup* ownerGroup = ownerUnit ? ownerUnit->GetGroup() : nullptr;
     AICenter* ownerCenter = ownerGroup ? ownerGroup->GetCenter() : nullptr;
@@ -920,7 +942,6 @@ void Landscape::ExplosionDammageEffects(EntityAI* owner, Shot* shot, Object* dir
 
     // small/big explosion
     bool smallExplosion = !type->explosive;
-    bool water = pos.Y() < _seaLevelWave + 0.01;
     const float craterTimeCoef = 5;
     if (smallExplosion)
     {
@@ -953,7 +974,10 @@ void Landscape::ExplosionDammageEffects(EntityAI* owner, Shot* shot, Object* dir
             }
             else
             {
-                crater = new Crater(shape, VehicleTypes.New("crater"), timeToLive, scale * 0.5, false, false, water);
+                // The legacy water-crater variant dereferences invalid effect state for
+                // projectile/vehicle explosions. Use the normal crater path until a
+                // dedicated Hydro splash effect replaces it.
+                crater = new Crater(shape, VehicleTypes.New("crater"), timeToLive, scale * 0.5, false, false, false);
                 Matrix4 transform;
                 Matrix4 toWorld = directHit->WorldTransform();
                 Vector3Val wDir = toWorld.Rotate(rDir);
@@ -981,7 +1005,7 @@ void Landscape::ExplosionDammageEffects(EntityAI* owner, Shot* shot, Object* dir
             transform.SetPosition(pos);
 
             Crater* crater =
-                new Crater(shape, VehicleTypes.New("crater"), timeToLive, scale * 0.5, false, false, water);
+                new Crater(shape, VehicleTypes.New("crater"), timeToLive, scale * 0.5, false, false, false);
             crater->SetTransform(transform);
             crater->SetAlpha(alpha);
             GLOB_WORLD->AddAnimal(crater);
@@ -1012,7 +1036,10 @@ void Landscape::ExplosionDammageEffects(EntityAI* owner, Shot* shot, Object* dir
                 LODShapeWithShadow* shape = GLOB_SCENE->Preloaded(CraterShell);
                 // small/big explosion
 
-                Vector3 offset = transform.Rotate(shape->BoundingCenter());
+                // CraterShell is optional presentation content. Some mission/explosion
+                // paths reach this effect before the preload is available; do not
+                // dereference a missing shape (crash-34524.dmp, 0xC0000005).
+                Vector3 offset = shape ? transform.Rotate(shape->BoundingCenter()) : VZero;
                 transform.SetPosition(Vector3(pos[0], surfY, pos[2]) + offset);
 
                 float timeToLive = scale * 60;
@@ -1021,7 +1048,7 @@ void Landscape::ExplosionDammageEffects(EntityAI* owner, Shot* shot, Object* dir
 
                 // create vehicle
                 Crater* crater =
-                    new Crater(shape, VehicleTypes.New("crater"), timeToLive, scale * 0.5, true, false, water);
+                    new Crater(shape, VehicleTypes.New("crater"), timeToLive, scale * 0.5, true, false, false);
                 crater->SetTransform(transform);
                 crater->SetAlpha(alpha);
                 GLOB_WORLD->AddAnimal(crater);

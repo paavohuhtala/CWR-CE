@@ -40,6 +40,31 @@ They are disjoint, so they **compose** (multiply visibilities / min), not compet
 normal redirects the existing SH sky-irradiance ambient (`frame::sky_irradiance`), which is the direct
 answer to "shaded slopes look flat."
 
+## 1a. Prerequisite audit (2026-08-03) — verified against the branch
+
+Checked before starting, because this plan's assumptions are older than the branch and
+the neighbouring plans turned out to be wrong in both directions (see
+[`RND-030-renderer-consolidation-20260803.md`](../../../docs/roadmap/decisions/RND-030-renderer-consolidation-20260803.md)).
+
+| Assumption in this plan | Verified state |
+| --- | --- |
+| The depth+normal prepass exists and runs | **True, and unconditional.** `prepass_enabled` defaults `true`; `WGR_PREPASS=0` is a dev A/B only. Its plan claims "Stages 0/2/3 still planned" — Stage 2 is in fact complete. |
+| Single-sample nearest-resolved depth already exists — reuse it | **True.** `depth_sample_view` (`gfx3d/mod.rs:1203`), fed by `DepthResolve` with `reduce_far:false`. At 1× it is the prepass depth aspect directly. Do not add a depth resolve. |
+| The normal target is `Rg16Float`, oct-encoded | **True.** `NORMAL_FORMAT`, written by the object and terrain prepass fragments via `gbuffer::oct_encode`. |
+| The normal target is MSAA and **not** resolved | **True — still the one missing input.** `wgr_3d_normal` is created with `sample_count: self.sample_count` and only `RENDER_ATTACHMENT \| TEXTURE_BINDING`; there is no `normal_resolve` / `NormalResolve` anywhere in the tree. |
+| MSAA is actually on in the shipped client | **Yes, 4×** — confirmed by the renderer's own startup line: `[wgr] effective gates: … msaa=4x`. So the MSAA path is the default path, not the exotic one, and the normal resolve is required work rather than an edge case. |
+| `@binding(10)` sky-vis is the pattern to copy for `@binding(11)` | **True.** `terrain_skyvis_mask` at `frame.wgsl:125`, with the matching layout and bind-builder entries in `gfx3d/mod.rs` (~566 and ~716) — both must be extended, which is the step the plan warns ate two positional-arg ABI bugs. |
+
+**Consequence:** the only prerequisite that does not already exist is the single-sample
+normal. Stage 1 should open with that resolve, and the plan's own advice — take **sample 0**
+rather than averaging oct-encoded normals, since a raw texel average is wrong across the
+oct wrap — stands.
+
+**Do not** start Stage 1 by extending `@binding(11)` first. The frame UBO group is shared by
+every 3D pipeline; a layout change with no producer bound is a validation error in every pass
+at once. Build the resolve, then the GTAO compute writing to a texture nothing samples, then
+wire the binding and the consumers last.
+
 ## 2. Inputs — already produced by the prepass
 
 The unconditional depth+normal prepass ([depth-prepass-plan.md](depth-prepass-plan.md)) was built as
@@ -146,14 +171,70 @@ normal where GTAO has coverage and the geometric normal elsewhere — GTAO's is 
 
 ## 7. Stages
 
-1. **Scalar GTAO + bilateral blur, composited × sky-vis onto ambient.** MSAA normal resolve (sample-0),
-   compute pass, spatial denoise, `@binding(11)` AO, multiply into the ambient of terrain + objects.
-   Debug view (raw AO greyscale, like sky-vis). ImGui: enable, radius, strength, slice/step counts,
-   blur width. **This is the bulk of the visible win.**
-2. **Bent normal → directional SH ambient.** Add the bent-normal output + `sky_irradiance(bent_n)`
-   path. Proper oct-normal resolve if sample-0 shimmers.
-3. **Polish:** multi-bounce curve, half-res + bilateral upsample perf path, thickness-heuristic tuning,
-   optional GTAO on the froxel/fog or objects-only fast path.
+> **Stage 1a landed (2026-08-03): the MSAA normal resolve.** `NormalResolve` in `gfx3d/mod.rs`
+> plus `gfx3d/normal_resolve.wgsl`, mirroring `DepthResolve`. Built only when
+> `sample_count > 1`; sized alongside the prepass normal target; exposed as
+> `Gfx3d::normal_sample_view()` (`None` at 1×, where `normal_view()` is already single-sample).
+>
+> It is **deliberately not recorded per frame yet** — nothing samples the resolved normal
+> until the GTAO pass exists, and a fullscreen pass with no consumer is per-frame GPU cost for
+> nothing. `NormalResolve::resolve()` is ready for GTAO to call. Same "present, deliberately
+> unwired" shape the compute skin bake uses.
+>
+> The sample-0 choice is pinned by a test that fails if the shader is changed to average raw
+> texels — verified by making it average and watching the test fail. That mistake looks *more*
+> principled than the correct code, which is exactly why it is worth a test: oct codes wrap, so
+> averaging two samples across the fold points nowhere near either normal.
+
+1. **Scalar GTAO + bilateral blur, composited × sky-vis onto ambient.** — **LANDED 2026-08-03.**
+   MSAA normal resolve (sample-0), compute pass, spatial denoise, `@binding(11)` AO, multiply into
+   the ambient of terrain + objects. Debug view (raw AO greyscale, like sky-vis). ImGui: enable,
+   radius, strength, slice/step counts, blur width. **This is the bulk of the visible win.**
+
+   > Wired in the order §1a demands: dispatches first, then `@binding(11)`, then the consumers.
+   > `Gfx3d::render_gtao` records the (nearest) depth resolve, the normal resolve, the GTAO
+   > compute and both blur dispatches, between the prepass and the forward colour pass. Gated by
+   > `Engine::AoSettings` → `WgrGtao` inside the existing `WgrRenderParams` block — the plan asked
+   > for a `wgr_set_gtao` setter, but that block already IS the struct-based answer to positional
+   > args and its own comment forbids new setters, so the knobs ride it instead. Default OFF;
+   > `WGR_GTAO=1` / `WGR_GTAO_DEBUG=1` boot it on, and the gate is echoed as
+   > `Wgpu: gtao gate:` at startup. Shadows tab hosts the controls, directly under sky-vis.
+   >
+   > **Two corrections to what was already committed**, both found by building the consumers:
+   >
+   > - The per-slice integral multiplied by a global `n·v`. That is not GTAO's normalisation, and
+   >   it darkens *unoccluded* ground by the cosine of the view angle — flat terrain would have
+   >   faded out toward the horizon and read as fog. Replaced with the real thing: project the
+   >   normal into each slice plane, weight by `|n_proj|`, integrate from that slice's own gamma.
+   >   Pinned by a numeric test asserting the unoccluded result is 1.0 at six view angles.
+   > - `AO_FORMAT` was `R8Unorm`, which is **not a core storage-texture format**. The AO texture
+   >   and both bind-group layouts naming it came back invalid, and the symptom surfaced a frame
+   >   graph away as `TextureView is invalid` on the shared camera bind group. Now `R32Float`.
+   >   The naga-only shader tests could not see this; a headless-device test now builds the real
+   >   resources and reads the AO buffer back, which is what catches this whole class.
+   >
+   > Grass is deliberately NOT a consumer yet. It writes prepass depth/normals so its AO exists,
+   > but thin blades are the case most likely to look wrong, and the plan scopes Stage 1 to
+   > terrain + objects. Water stays untouched as specified.
+   >
+   > **Needs eyes:** the raw AO debug view on a real island. Nothing below is worth tuning until
+   > someone has confirmed the buffer looks like ambient occlusion.
+2. **Bent normal → directional SH ambient.** — **LANDED 2026-08-05** (`6cefd0b`). Bent normal
+   accumulated per slice, weighted by the same `proj_len` as the visibility, shared with AO in one
+   Rgba16Float target so the bilateral blur filters both with identical weights. Consumed by
+   `terrain.wgsl` + `shading.wgsl` via `gtao_bent_normal_world`. Own toggle; debug view mode 2
+   draws it as RGB. Sample-0 normal resolve has not shimmered; no proper oct resolve needed yet.
+3. **Polish:** — **hierarchical march landed and is DEFAULT OFF** (`6cefd0b`, `4c4cae5`).
+   `gtao_depth_mips` builds a linear-view-Z chain (min-reduced = nearest surface; the Hi-Z pyramid
+   next door is min-over-reversed-Z = *farthest*, correct for culling and backwards for AO).
+   It works, and it flickers: which surface wins a coarse `min` changes abruptly as geometry enters
+   the block, and there is no TAA to absorb that. Blending neighbouring mips — the textbook fix —
+   made it markedly worse, because a coarse min-reduced texel and a fine one describe different
+   surfaces, so lerping them yields a depth matching no geometry. Kept behind `AoSettings::maxMip`
+   (default 0) rather than reverted, with the reasoning in `gtao.wgsl`, because the next person
+   will have the same idea.
+   Still open: multi-bounce curve, half-res + bilateral upsample, thickness tuning, **and measuring
+   the frame cost**, which has never been done.
 
 ## 8. Plumbing / files
 

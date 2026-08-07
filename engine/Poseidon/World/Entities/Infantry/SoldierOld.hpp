@@ -552,6 +552,8 @@ class Man: public Person
 	Foundation::Time _lastInaccuracyDistTime;
 
 	float _waterDepth;
+	float _hydroWaterDepth;
+	bool _waterBuoyancyContact;
 
 	Foundation::Time _whenKilled;
 	Foundation::Time _lastMovementTime;
